@@ -1,0 +1,2 @@
+"""FairAid backend package."""
+
