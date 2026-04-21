@@ -15,6 +15,24 @@ from backend.core.domain import (
 EmergencyLevel = Literal["emergency", "non_emergency"]
 NeedStatus = Literal["open", "in_progress", "closed"]
 
+SPECIALIST_ALIAS_MAP = {
+    "doctor": "medical",
+    "nurse": "medical",
+    "paramedic": "medical",
+    "surgeon": "medical",
+    "pharmacist": "medical",
+    "physiotherapist": "medical",
+    "public-health": "public-health",
+    "educator": "education",
+    "teacher": "education",
+    "counselor": "counseling",
+    "psychologist": "counseling",
+    "mental-health": "counseling",
+    "lawyer": "legal-aid",
+    "legal": "legal-aid",
+    "vet": "veterinary",
+}
+
 
 class ContactPoint(BaseModel):
     name: str = Field(min_length=2, max_length=120)
@@ -122,13 +140,21 @@ class NeedCreateRequest(BaseModel):
     @field_validator("required_specialists")
     @classmethod
     def _validate_required_specialists(cls, value: list[str]) -> list[str]:
-        invalid = sorted({item for item in value if item not in SPECIALIST_LIBRARY})
+        normalized: list[str] = []
+        for item in value:
+            canonical = item.strip().lower().replace("_", "-").replace(" ", "-")
+            canonical = SPECIALIST_ALIAS_MAP.get(canonical, canonical)
+            if canonical:
+                normalized.append(canonical)
+
+        invalid = sorted({item for item in normalized if item not in SPECIALIST_LIBRARY})
         if invalid:
             raise ValueError(
                 f"Unknown required_specialists: {', '.join(invalid)}. "
                 f"Allowed values: {', '.join(SPECIALIST_LIBRARY)}"
             )
-        return value
+        deduped = list(dict.fromkeys(normalized))
+        return deduped
 
     @field_validator("language_requirements")
     @classmethod

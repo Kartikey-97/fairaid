@@ -4,6 +4,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+import re
 from uuid import uuid4
 
 try:
@@ -13,6 +14,14 @@ except ImportError:  # pragma: no cover - optional dependency
     psycopg = None
     dict_row = None
 
+from backend.core.domain import (
+    JOB_LIBRARY,
+    LANGUAGE_LIBRARY,
+    NEED_TYPE_LIBRARY,
+    SKILL_LIBRARY,
+    SPECIALIST_LIBRARY,
+)
+
 DB_PATH = Path(__file__).resolve().parents[3] / "data" / "fairaid.db"
 
 
@@ -21,22 +30,25 @@ def _resolve_database_url() -> str:
     if env_value:
         return env_value
 
-    env_file = Path(__file__).resolve().parents[3] / ".env"
-    if not env_file.exists():
-        return ""
+    project_root = Path(__file__).resolve().parents[3]
+    backend_root = project_root / "backend"
+    env_candidates = [backend_root / ".env", project_root / ".env"]
 
-    try:
-        lines = env_file.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return ""
-
-    for raw_line in lines:
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
+    for env_file in env_candidates:
+        if not env_file.exists():
             continue
-        key, value = line.split("=", 1)
-        if key.strip() == "FAIRAID_DATABASE_URL":
-            return value.strip().strip("'").strip('"')
+        try:
+            lines = env_file.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            if key.strip() == "FAIRAID_DATABASE_URL":
+                return value.strip().strip("'").strip('"')
     return ""
 
 
@@ -78,6 +90,86 @@ def _from_json_dict(value: str | None) -> dict:
     if not isinstance(parsed, dict):
         return {}
     return parsed
+
+
+def _normalize_choice(value: object, allowed: list[str]) -> str | None:
+    text = str(value).strip().lower()
+    if not text:
+        return None
+
+    compact = re.sub(r"\s+", " ", text)
+    candidates = [
+        compact,
+        compact.replace("_", " "),
+        compact.replace("-", " "),
+        compact.replace(" ", "-"),
+        compact.replace("_", "-"),
+    ]
+    for candidate in candidates:
+        if candidate in allowed:
+            return candidate
+    return None
+
+
+def _normalize_skill(value: object) -> str | None:
+    return _normalize_choice(value, SKILL_LIBRARY)
+
+
+def _normalize_need_type(value: object) -> str | None:
+    return _normalize_choice(value, NEED_TYPE_LIBRARY)
+
+
+def _normalize_job(value: object) -> str | None:
+    return _normalize_choice(value, JOB_LIBRARY)
+
+
+def _normalize_language(value: object) -> str | None:
+    return _normalize_choice(value, LANGUAGE_LIBRARY)
+
+
+def _normalize_specialist(value: object) -> str | None:
+    text = str(value).strip().lower()
+    if not text:
+        return None
+
+    normalized = re.sub(r"\s+", "-", text.replace("_", "-"))
+    specialist_aliases = {
+        "doctor": "medical",
+        "nurse": "medical",
+        "paramedic": "medical",
+        "surgeon": "medical",
+        "pharmacist": "medical",
+        "physiotherapist": "medical",
+        "public-health-officer": "public-health",
+        "public-health-worker": "public-health",
+        "public-health": "public-health",
+        "teacher": "education",
+        "educator": "education",
+        "counselor": "counseling",
+        "psychologist": "counseling",
+        "mental-health": "counseling",
+        "lawyer": "legal-aid",
+        "legal": "legal-aid",
+        "it": "it-support",
+        "it-support-engineer": "it-support",
+        "vet": "veterinary",
+    }
+    mapped = specialist_aliases.get(normalized, normalized)
+    if mapped in SPECIALIST_LIBRARY:
+        return mapped
+    return _normalize_choice(mapped, SPECIALIST_LIBRARY)
+
+
+def _normalize_list(values: list[object], normalizer) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        item = normalizer(value)
+        if not item or item in seen:
+            continue
+        normalized.append(item)
+        seen.add(item)
+    return normalized
 
 
 def _adapt_query(query: str) -> str:
@@ -332,6 +424,27 @@ def initialize_database() -> None:
             )
             """,
         )
+        _execute(
+            cursor,
+            """
+            CREATE TABLE IF NOT EXISTS field_reports (
+                id TEXT PRIMARY KEY,
+                volunteer_id TEXT,
+                summary TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                categories_json TEXT NOT NULL,
+                supply_needs_json TEXT NOT NULL,
+                people_count_estimate INTEGER NOT NULL DEFAULT 0,
+                required_volunteers_estimate INTEGER NOT NULL DEFAULT 0,
+                location_lat REAL,
+                location_lng REAL,
+                address TEXT,
+                raw_audio_text TEXT,
+                image_hint TEXT,
+                created_at TEXT NOT NULL
+            )
+            """,
+        )
 
         # Lightweight migrations for existing DBs.
         _ensure_column(cursor, "volunteers", "address", "TEXT")
@@ -342,10 +455,16 @@ def initialize_database() -> None:
         _ensure_column(cursor, "volunteers", "verification_notes", "TEXT")
         _ensure_column(cursor, "needs", "job_category", "TEXT")
 
+        # Migrate legacy 'interested' decision -> 'pinned'
+        _execute(
+            cursor,
+            "UPDATE applications SET decision = 'pinned' WHERE decision = 'interested'",
+        )
         connection.commit()
 
     _seed_dummy_data_if_empty()
     _seed_supplemental_demo_data()
+    _seed_extra_demo_volunteers()
 
 
 def _seed_dummy_data_if_empty() -> None:
@@ -461,7 +580,7 @@ def _seed_dummy_data_if_empty() -> None:
                 skills_json, certifications_json, specialist_domains_json,
                 preferred_need_types_json, languages_json, availability_json,
                 can_handle_emergency, notes, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             volunteers,
         )
@@ -936,6 +1055,21 @@ def upsert_volunteer(payload: dict) -> dict:
 
 
 def _volunteer_from_row(row: sqlite3.Row | dict) -> dict:
+    job_title = _normalize_job(_row_get(row, "job_title"))
+    skills = _normalize_list(_from_json_list(_row_get(row, "skills_json")), _normalize_skill)
+    specialist_domains = _normalize_list(
+        _from_json_list(_row_get(row, "specialist_domains_json")),
+        _normalize_specialist,
+    )
+    preferred_need_types = _normalize_list(
+        _from_json_list(_row_get(row, "preferred_need_types_json")),
+        _normalize_need_type,
+    )
+    languages = _normalize_list(
+        _from_json_list(_row_get(row, "languages_json")),
+        _normalize_language,
+    )
+
     return {
         "id": _row_get(row, "id"),
         "user_id": _row_get(row, "user_id"),
@@ -944,17 +1078,17 @@ def _volunteer_from_row(row: sqlite3.Row | dict) -> dict:
         "phone": _row_get(row, "phone"),
         "address": _row_get(row, "address"),
         "profile_image_url": _row_get(row, "profile_image_url"),
-        "job_title": _row_get(row, "job_title"),
+        "job_title": job_title,
         "license_number": _row_get(row, "license_number"),
         "license_verified": bool(_row_get(row, "license_verified")),
         "verification_notes": _row_get(row, "verification_notes"),
         "location": {"lat": _row_get(row, "lat"), "lng": _row_get(row, "lng")},
         "radius_km": _row_get(row, "radius_km"),
-        "skills": _from_json_list(_row_get(row, "skills_json")),
+        "skills": skills,
         "certifications": _from_json_list(_row_get(row, "certifications_json")),
-        "specialist_domains": _from_json_list(_row_get(row, "specialist_domains_json")),
-        "preferred_need_types": _from_json_list(_row_get(row, "preferred_need_types_json")),
-        "languages": _from_json_list(_row_get(row, "languages_json")),
+        "specialist_domains": specialist_domains,
+        "preferred_need_types": preferred_need_types,
+        "languages": languages,
         "availability": _from_json_list(_row_get(row, "availability_json")),
         "can_handle_emergency": bool(_row_get(row, "can_handle_emergency")),
         "notes": _row_get(row, "notes"),
@@ -1239,6 +1373,165 @@ def mark_notification_read(notification_id: str, volunteer_id: str) -> bool:
         return True
 
 
+def create_field_report(payload: dict) -> dict:
+    report_id = f"fr_{uuid4().hex[:12]}"
+    timestamp = _now_iso()
+    categories = payload.get("categories", [])
+    supply_needs = payload.get("supply_needs", [])
+    location = payload.get("location") or {}
+
+    with get_connection() as connection:
+        cursor = connection.cursor()
+        _execute(
+            cursor,
+            """
+            CREATE TABLE IF NOT EXISTS field_reports (
+                id TEXT PRIMARY KEY,
+                volunteer_id TEXT,
+                summary TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                categories_json TEXT NOT NULL,
+                supply_needs_json TEXT NOT NULL,
+                people_count_estimate INTEGER NOT NULL DEFAULT 0,
+                required_volunteers_estimate INTEGER NOT NULL DEFAULT 0,
+                location_lat REAL,
+                location_lng REAL,
+                address TEXT,
+                raw_audio_text TEXT,
+                image_hint TEXT,
+                created_at TEXT NOT NULL
+            )
+            """,
+        )
+        _execute(
+            cursor,
+            """
+            INSERT INTO field_reports (
+                id, volunteer_id, summary, severity, categories_json, supply_needs_json,
+                people_count_estimate, required_volunteers_estimate, location_lat, location_lng,
+                address, raw_audio_text, image_hint, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                report_id,
+                payload.get("volunteer_id"),
+                payload.get("summary", ""),
+                payload.get("severity", "medium"),
+                _to_json(categories if isinstance(categories, list) else []),
+                _to_json(supply_needs if isinstance(supply_needs, list) else []),
+                int(payload.get("people_count_estimate", 0) or 0),
+                int(payload.get("required_volunteers_estimate", 0) or 0),
+                location.get("lat"),
+                location.get("lng"),
+                payload.get("address"),
+                payload.get("raw_audio_text"),
+                payload.get("image_hint"),
+                timestamp,
+            ),
+        )
+        connection.commit()
+
+    created = get_field_report(report_id)
+    if created is None:
+        raise RuntimeError("Field report could not be created.")
+    return created
+
+
+def _field_report_from_row(row: sqlite3.Row | dict) -> dict:
+    return {
+        "id": _row_get(row, "id"),
+        "volunteer_id": _row_get(row, "volunteer_id"),
+        "summary": _row_get(row, "summary"),
+        "severity": _row_get(row, "severity"),
+        "categories": _from_json_list(_row_get(row, "categories_json")),
+        "supply_needs": _from_json_list(_row_get(row, "supply_needs_json")),
+        "people_count_estimate": int(_row_get(row, "people_count_estimate") or 0),
+        "required_volunteers_estimate": int(
+            _row_get(row, "required_volunteers_estimate") or 0
+        ),
+        "location": (
+            {
+                "lat": _row_get(row, "location_lat"),
+                "lng": _row_get(row, "location_lng"),
+            }
+            if _row_get(row, "location_lat") is not None
+            and _row_get(row, "location_lng") is not None
+            else None
+        ),
+        "address": _row_get(row, "address"),
+        "raw_audio_text": _row_get(row, "raw_audio_text"),
+        "image_hint": _row_get(row, "image_hint"),
+        "created_at": _row_get(row, "created_at"),
+    }
+
+
+def get_field_report(report_id: str) -> dict | None:
+    with get_connection() as connection:
+        cursor = connection.cursor()
+        _execute(
+            cursor,
+            """
+            CREATE TABLE IF NOT EXISTS field_reports (
+                id TEXT PRIMARY KEY,
+                volunteer_id TEXT,
+                summary TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                categories_json TEXT NOT NULL,
+                supply_needs_json TEXT NOT NULL,
+                people_count_estimate INTEGER NOT NULL DEFAULT 0,
+                required_volunteers_estimate INTEGER NOT NULL DEFAULT 0,
+                location_lat REAL,
+                location_lng REAL,
+                address TEXT,
+                raw_audio_text TEXT,
+                image_hint TEXT,
+                created_at TEXT NOT NULL
+            )
+            """,
+        )
+        row = _execute(
+            cursor,
+            "SELECT * FROM field_reports WHERE id = ?",
+            (report_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return _field_report_from_row(row)
+
+
+def list_field_reports(limit: int = 50) -> list[dict]:
+    safe_limit = max(1, min(int(limit), 200))
+    with get_connection() as connection:
+        cursor = connection.cursor()
+        _execute(
+            cursor,
+            """
+            CREATE TABLE IF NOT EXISTS field_reports (
+                id TEXT PRIMARY KEY,
+                volunteer_id TEXT,
+                summary TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                categories_json TEXT NOT NULL,
+                supply_needs_json TEXT NOT NULL,
+                people_count_estimate INTEGER NOT NULL DEFAULT 0,
+                required_volunteers_estimate INTEGER NOT NULL DEFAULT 0,
+                location_lat REAL,
+                location_lng REAL,
+                address TEXT,
+                raw_audio_text TEXT,
+                image_hint TEXT,
+                created_at TEXT NOT NULL
+            )
+            """,
+        )
+        rows = _execute(
+            cursor,
+            "SELECT * FROM field_reports ORDER BY created_at DESC LIMIT ?",
+            (safe_limit,),
+        ).fetchall()
+    return [_field_report_from_row(row) for row in rows]
+
+
 def _application_counts(need_id: str) -> dict:
     with get_connection() as connection:
         cursor = connection.cursor()
@@ -1259,7 +1552,7 @@ def _application_counts(need_id: str) -> dict:
         if decision == "accepted":
             accepted += 1
             assigned_volunteers.append(volunteer_id)
-        elif decision == "interested":
+        elif decision in {"interested", "pinned"}:
             interested += 1
         elif decision == "declined":
             declined += 1
@@ -1274,22 +1567,37 @@ def _application_counts(need_id: str) -> dict:
 
 def _need_from_row(row: sqlite3.Row | dict) -> dict:
     counts = _application_counts(_row_get(row, "id"))
+    need_type = _normalize_need_type(_row_get(row, "need_type")) or "community-support"
+    job_category = _normalize_job(_row_get(row, "job_category"))
+    required_skills = _normalize_list(
+        _from_json_list(_row_get(row, "required_skills_json")),
+        _normalize_skill,
+    )
+    required_specialists = _normalize_list(
+        _from_json_list(_row_get(row, "required_specialists_json")),
+        _normalize_specialist,
+    )
+    language_requirements = _normalize_list(
+        _from_json_list(_row_get(row, "language_requirements_json")),
+        _normalize_language,
+    )
+
     return {
         "id": _row_get(row, "id"),
         "ngo_id": _row_get(row, "ngo_id"),
         "ngo_name": _row_get(row, "ngo_name"),
         "title": _row_get(row, "title"),
         "description": _row_get(row, "description"),
-        "need_type": _row_get(row, "need_type"),
-        "job_category": _row_get(row, "job_category"),
+        "need_type": need_type,
+        "job_category": job_category,
         "emergency_level": _row_get(row, "emergency_level"),
         "is_critical": bool(_row_get(row, "is_critical")),
         "urgency": _row_get(row, "urgency"),
         "impact_level": _row_get(row, "impact_level"),
         "required_volunteers": _row_get(row, "required_volunteers"),
-        "required_skills": _from_json_list(_row_get(row, "required_skills_json")),
-        "required_specialists": _from_json_list(_row_get(row, "required_specialists_json")),
-        "language_requirements": _from_json_list(_row_get(row, "language_requirements_json")),
+        "required_skills": required_skills,
+        "required_specialists": required_specialists,
+        "language_requirements": language_requirements,
         "min_volunteer_age": _row_get(row, "min_volunteer_age"),
         "background_check_required": bool(_row_get(row, "background_check_required")),
         "beneficiary_count": _row_get(row, "beneficiary_count"),
@@ -1453,3 +1761,252 @@ def database_runtime_info() -> dict:
         "postgres_error": LAST_POSTGRES_ERROR,
         "sqlite_path": str(DB_PATH),
     }
+
+
+def list_need_applications(need_id: str) -> list[dict]:
+    """Return all applications for a need with volunteer profile details (for NGO roster view)."""
+    with get_connection() as connection:
+        cursor = connection.cursor()
+        rows = _execute(
+            cursor,
+            """
+            SELECT
+                a.id          AS app_id,
+                a.volunteer_id,
+                a.decision,
+                a.note,
+                a.created_at  AS applied_at,
+                v.name,
+                v.email,
+                v.phone,
+                v.job_title,
+                v.profile_image_url,
+                v.lat,
+                v.lng,
+                v.license_verified
+            FROM applications a
+            JOIN volunteers v ON v.id = a.volunteer_id
+            WHERE a.need_id = ?
+            ORDER BY
+                CASE a.decision
+                    WHEN 'accepted' THEN 0
+                    WHEN 'pinned'   THEN 1
+                    ELSE 2
+                END,
+                a.created_at ASC
+            """,
+            (need_id,),
+        ).fetchall()
+
+    result: list[dict] = []
+    for row in rows:
+        result.append({
+            "app_id":            _row_get(row, "app_id"),
+            "volunteer_id":      _row_get(row, "volunteer_id"),
+            "decision":          _row_get(row, "decision"),
+            "note":              _row_get(row, "note"),
+            "applied_at":        _row_get(row, "applied_at"),
+            "name":              _row_get(row, "name"),
+            "email":             _row_get(row, "email"),
+            "phone":             _row_get(row, "phone"),
+            "job_title":         _row_get(row, "job_title"),
+            "profile_image_url": _row_get(row, "profile_image_url"),
+            "lat":               _row_get(row, "lat"),
+            "lng":               _row_get(row, "lng"),
+            "license_verified":  bool(_row_get(row, "license_verified")),
+        })
+    return result
+
+
+def _seed_extra_demo_volunteers() -> None:
+    """Add 7 diverse demo volunteers + 3 extra needs if not already seeded."""
+    with get_connection() as connection:
+        cursor = connection.cursor()
+        now = _now_iso()
+
+        extra_users = [
+            ("user_vol_demo_4",  "volunteer", "Priya Kapoor",     "priya@fairaid.org",  "demo123"),
+            ("user_vol_demo_5",  "volunteer", "Rohan Joshi",      "rohan@fairaid.org",  "demo123"),
+            ("user_vol_demo_6",  "volunteer", "Meera Iyer",       "meera@fairaid.org",  "demo123"),
+            ("user_vol_demo_7",  "volunteer", "Aman Khan",        "aman@fairaid.org",   "demo123"),
+            ("user_vol_demo_8",  "volunteer", "Dr. Sunita Rao",   "sunita@fairaid.org", "demo123"),
+            ("user_vol_demo_9",  "volunteer", "Kabir Malhotra",   "kabir@fairaid.org",  "demo123"),
+            ("user_vol_demo_10", "volunteer", "Farida Sheikh",    "farida@fairaid.org", "demo123"),
+        ]
+        for uid, role, name, email, pwd in extra_users:
+            if _execute(cursor, "SELECT id FROM users WHERE id = ?", (uid,)).fetchone() is None:
+                _execute(
+                    cursor,
+                    "INSERT INTO users (id, role, name, email, password, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (uid, role, name, email, pwd, now),
+                )
+
+        vol_sql = """
+        INSERT INTO volunteers (
+            id, user_id, name, email, phone, address, profile_image_url, job_title,
+            license_number, license_verified, verification_notes,
+            lat, lng, radius_km,
+            skills_json, certifications_json, specialist_domains_json,
+            preferred_need_types_json, languages_json, availability_json,
+            can_handle_emergency, notes, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        extra_vols = [
+            ("vol_demo_004", "user_vol_demo_4",  "Priya Kapoor",   "priya@fairaid.org",
+             "+91-9811001100", "Saket, New Delhi",          "https://i.pravatar.cc/160?img=47",
+             "nurse",                "NRS-DL-20230088", 1, "Registered nurse, license verified.",
+             28.5270, 77.2131, 30.0,
+             _to_json(["first aid","nursing care","medical support","triage"]),
+             _to_json(["bcls","acls"]),
+             _to_json(["medical","public-health"]),
+             _to_json(["medical-camp","shelter"]),
+             _to_json(["hindi","english"]),
+             _to_json([]), 1, "Available for night shifts."),
+            ("vol_demo_005", "user_vol_demo_5",  "Rohan Joshi",    "rohan@fairaid.org",
+             "+91-9871234567", "Sector 62, Noida",           "https://i.pravatar.cc/160?img=15",
+             "operations volunteer", "",                0, "",
+             28.6271, 77.3708, 40.0,
+             _to_json(["logistics","supply chain","crowd management"]),
+             _to_json(["logistics"]),
+             _to_json(["disaster-management"]),
+             _to_json(["food-distribution","shelter"]),
+             _to_json(["hindi","english"]),
+             _to_json([]), 1, "Logistics coordinator."),
+            ("vol_demo_006", "user_vol_demo_6",  "Meera Iyer",     "meera@fairaid.org",
+             "+91-9845678901", "DLF Phase 2, Gurugram",      "https://i.pravatar.cc/160?img=25",
+             "counselor",           "PSY-H-2021-004",  1, "Licensed psychologist.",
+             28.4813, 77.0879, 35.0,
+             _to_json(["counseling","mental health support","child safety"]),
+             _to_json(["mental-health-first-aid"]),
+             _to_json(["counseling"]),
+             _to_json(["mental-health","education"]),
+             _to_json(["hindi","tamil","english"]),
+             _to_json([]), 0, "Trauma and PTSD specialist."),
+            ("vol_demo_007", "user_vol_demo_7",  "Aman Khan",      "aman@fairaid.org",
+             "+91-9315577890", "Old Faridabad",               "https://i.pravatar.cc/160?img=57",
+             "operations volunteer", "",                0, "",
+             28.4089, 77.3178, 50.0,
+             _to_json(["driving","logistics","heavy equipment"]),
+             _to_json(["hgv-license"]),
+             _to_json(["disaster-management"]),
+             _to_json(["shelter","rescue-support"]),
+             _to_json(["hindi","urdu"]),
+             _to_json([]), 1, "HGV driver, can transport supplies."),
+            ("vol_demo_008", "user_vol_demo_8",  "Dr. Sunita Rao", "sunita@fairaid.org",
+             "+91-9712233445", "Vaishali, Ghaziabad",         "https://i.pravatar.cc/160?img=44",
+             "doctor",              "DOC-UP-776612",  1, "Senior physician, verified.",
+             28.6426, 77.3487, 45.0,
+             _to_json(["doctor","triage","public health","vaccination"]),
+             _to_json(["mbbs","md-community-medicine"]),
+             _to_json(["medical","public-health"]),
+             _to_json(["medical-camp","sanitation"]),
+             _to_json(["hindi","telugu","english"]),
+             _to_json([]), 1, "Public health specialist."),
+            ("vol_demo_009", "user_vol_demo_9",  "Kabir Malhotra", "kabir@fairaid.org",
+             "+91-9891234000", "Rohini Sector 11, Delhi",    "https://i.pravatar.cc/160?img=61",
+             "teacher",             "",                0, "",
+             28.7041, 77.1025, 25.0,
+             _to_json(["teaching","child safety","literacy"]),
+             _to_json(["child-protection"]),
+             _to_json(["education"]),
+             _to_json(["education","food-distribution"]),
+             _to_json(["hindi","punjabi","english"]),
+             _to_json([]), 1, "Primary school teacher."),
+            ("vol_demo_010", "user_vol_demo_10", "Farida Sheikh",  "farida@fairaid.org",
+             "+91-9988001122", "Sector 45, Noida",            "https://i.pravatar.cc/160?img=38",
+             "operations volunteer", "",                0, "",
+             28.5612, 77.3742, 30.0,
+             _to_json(["translation","community outreach","sign language"]),
+             _to_json(["interpreter-certification"]),
+             _to_json(["legal-aid"]),
+             _to_json(["education","shelter","mental-health"]),
+             _to_json(["hindi","bengali","urdu","english"]),
+             _to_json([]), 1, "Multilingual coordinator."),
+        ]
+        for v in extra_vols:
+            if _execute(cursor, "SELECT id FROM volunteers WHERE id = ?", (v[0],)).fetchone() is None:
+                _execute(cursor, vol_sql, (*v, now, now))
+
+        need_sql = """
+        INSERT INTO needs (
+            id, ngo_id, ngo_name, title, description,
+            need_type, job_category, emergency_level, is_critical,
+            urgency, impact_level, required_volunteers,
+            required_skills_json, required_specialists_json, language_requirements_json,
+            min_volunteer_age, background_check_required, beneficiary_count,
+            emergency_radius_km, lat, lng, address,
+            start_time, end_time, contact_json,
+            safety_notes, resources_available, logistics_notes,
+            status, notified_volunteer_ids_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        extra_needs = [
+            ("need_demo_004", "user_ngo_demo", "Sahara Community Relief",
+             "Trauma Counselling for Displaced Families",
+             "Families in Noida relief camps showing acute trauma. Need qualified counselors.",
+             "mental-health", "counselor", "non_emergency", 0, 4, 4, 12,
+             _to_json(["counseling","mental health support"]),
+             _to_json(["counseling"]),
+             _to_json(["hindi","english"]),
+             None, 0, 80, 25.0, 28.5350, 77.3910,
+             "Relief Camp B, Sector 45, Noida",
+             "2026-04-10T10:00:00+05:30", "2026-04-10T17:00:00+05:30",
+             _to_json({"name": "Dr. Priya Sinha", "phone": "+91-9555566677"}),
+             "Use trauma-informed language.", "Quiet tents provided.",
+             "Briefing at 09:30.", "open", _to_json([])),
+            ("need_demo_005", "user_ngo_demo", "Sahara Community Relief",
+             "Emergency Shelter Setup — Faridabad South",
+             "Assemble 40 temporary shelters. Physical fitness essential.",
+             "shelter", "operations volunteer", "emergency", 1, 5, 5, 25,
+             _to_json(["logistics","heavy equipment","crowd management"]),
+             _to_json(["disaster-management"]),
+             _to_json(["hindi"]),
+             18, 0, 200, 35.0, 28.4200, 77.3050,
+             "Site C, NH-19 Service Road, Faridabad",
+             "2026-04-09T07:00:00+05:30", "2026-04-09T19:00:00+05:30",
+             _to_json({"name": "Suresh Nair", "phone": "+91-9111222333"}),
+             "Wear closed shoes. Hard hats provided.", "Tools and tarpaulins available.",
+             "Report to Gate 2.", "open", _to_json([])),
+            ("need_demo_006", "user_ngo_demo", "Sahara Community Relief",
+             "Water Sanitation Drive — Ghaziabad East",
+             "Distribute water purification tablets. Queue management + health guidance.",
+             "sanitation", "operations volunteer", "non_emergency", 0, 3, 4, 18,
+             _to_json(["logistics","public health","crowd management"]),
+             _to_json(["public-health"]),
+             _to_json(["hindi"]),
+             None, 0, 500, 20.0, 28.6692, 77.4538,
+             "Community Centre, Vasundhara, Ghaziabad",
+             "2026-04-11T09:00:00+05:30", "2026-04-11T15:00:00+05:30",
+             _to_json({"name": "Anika Singh", "phone": "+91-9876543210"}),
+             "Ensure water is chlorinated.", "Tablets and hygiene kits provided.",
+             "Meet at main entrance 08:45.", "open", _to_json([])),
+        ]
+        for n in extra_needs:
+            if _execute(cursor, "SELECT id FROM needs WHERE id = ?", (n[0],)).fetchone() is None:
+                _execute(cursor, need_sql, (*n, now, now))
+
+        app_sql = """
+        INSERT INTO applications (id, need_id, volunteer_id, decision, note, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """
+        extra_apps = [
+            ("app_demo_010", "need_demo_001", "vol_demo_004", "accepted", "Nurse joining medical team."),
+            ("app_demo_011", "need_demo_002", "vol_demo_009", "accepted", "Teacher confirming attendance."),
+            ("app_demo_012", "need_demo_003", "vol_demo_005", "accepted", "Logistics coordinator ready."),
+            ("app_demo_013", "need_demo_004", "vol_demo_006", "accepted", "Counselor available all day."),
+            ("app_demo_014", "need_demo_004", "vol_demo_010", "pinned",   "Can translate for Bengali families."),
+            ("app_demo_015", "need_demo_005", "vol_demo_007", "accepted", "HGV driver ready."),
+            ("app_demo_016", "need_demo_005", "vol_demo_005", "accepted", "Logistics support."),
+            ("app_demo_017", "need_demo_006", "vol_demo_008", "accepted", "Public health doctor."),
+            ("app_demo_018", "need_demo_006", "vol_demo_001", "pinned",   "Available if backup needed."),
+        ]
+        for app_id, need_id, vol_id, decision, note in extra_apps:
+            existing = _execute(
+                cursor,
+                "SELECT id FROM applications WHERE id = ? OR (need_id = ? AND volunteer_id = ?)",
+                (app_id, need_id, vol_id),
+            ).fetchone()
+            if existing is None:
+                _execute(cursor, app_sql, (app_id, need_id, vol_id, decision, note, now, now))
+
+        connection.commit()

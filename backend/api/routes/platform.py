@@ -7,7 +7,7 @@ from urllib.error import URLError
 from urllib.parse import quote_plus
 from urllib.request import Request, urlopen
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 
 from backend.api.schemas.need import (
     NeedAuditEntry,
@@ -38,6 +38,7 @@ from backend.core.domain import (
     SKILL_LIBRARY,
     SPECIALIST_LIBRARY,
 )
+from backend.core.ai import analyze_crisis_multimodal, build_dispatch_briefing
 from backend.models.need_prediction import SemanticMatcher
 
 router = APIRouter(prefix="/platform", tags=["platform"])
@@ -115,6 +116,8 @@ NEED_TEMPLATES: list[NeedTemplate] = [
         },
     ),
 ]
+
+SEVERITY_PRIORITY = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 
 
 def _clamp01(value: float) -> float:
@@ -416,6 +419,28 @@ def _extract_keywords(text: str, choices: list[str]) -> list[str]:
     return hits
 
 
+def _normalize_severity(value: str) -> str:
+    lowered = (value or "").strip().lower()
+    if lowered in {"low", "medium", "high", "critical"}:
+        return lowered
+    return "medium"
+
+
+def _dispatch_score(volunteer: dict, need: dict) -> float:
+    distance_km = _distance_km(volunteer, need)
+    distance_limit = _distance_limit_km(volunteer, need)
+    distance_norm = _clamp01(distance_km / max(distance_limit, 1.0))
+    distance_priority = 1.0 - distance_norm
+
+    capability = _capability_score(volunteer, need)
+    semantic = SEMANTIC_MATCHER.similarity(
+        _volunteer_semantic_text(volunteer),
+        _needs_semantic_text(need),
+    )
+    score = (0.5 * distance_priority) + (0.35 * capability) + (0.15 * semantic)
+    return _clamp01(score)
+
+
 def _draft_need_from_text(text: str) -> NeedDraftResponse:
     lowered = text.lower()
     template_id = None
@@ -557,7 +582,7 @@ def _build_recommendation_card(volunteer: dict, need: dict) -> VolunteerNeedCard
 
     reasons: list[str] = []
     if duration_mins is not None:
-        reasons.append(f"🚗 {int(duration_mins)} min drive ETA")
+        reasons.append(f"{int(duration_mins)} min drive ETA")
     if within_distance:
         reasons.append("Within your response radius")
     else:
@@ -1066,6 +1091,21 @@ def get_hotspots() -> dict:
         total_needed += req
         total_assigned += acc
 
+    # Include multimodal field intelligence signals so urgent zones appear quickly
+    # even before NGO operators complete manual request entries.
+    for report in storage.list_field_reports(limit=80):
+        categories = report.get("categories") or []
+        if not categories:
+            categories = ["community-support"]
+        report_required = int(report.get("required_volunteers_estimate", 0) or 0)
+        for category in categories[:3]:
+            cat = str(category or "community-support")
+            if cat not in category_counts:
+                category_counts[cat] = {"count": 0, "required_volunteers": 0, "accepted_volunteers": 0}
+            category_counts[cat]["count"] += 1
+            category_counts[cat]["required_volunteers"] += report_required
+            total_needed += report_required
+
     urgent_categories = sorted(
         [{"category": k, **v} for k, v in category_counts.items()],
         key=lambda x: int(x["required_volunteers"]) - int(x["accepted_volunteers"]),
@@ -1078,3 +1118,223 @@ def get_hotspots() -> dict:
         "total_volunteers_assigned": total_assigned,
         "urgent_categories": urgent_categories,
     }
+
+
+@router.post("/field-intel/report")
+async def create_field_intel_report(
+    volunteer_id: str = Form(...),
+    notes: str = Form(default=""),
+    address: str | None = Form(default=None),
+    lat: float | None = Form(default=None),
+    lng: float | None = Form(default=None),
+    image_file: UploadFile | None = File(default=None),
+    audio_file: UploadFile | None = File(default=None),
+) -> dict:
+    volunteer = storage.get_volunteer(volunteer_id)
+    if volunteer is None:
+        raise HTTPException(status_code=404, detail="Volunteer not found")
+
+    image_bytes = await image_file.read() if image_file else None
+    audio_bytes = await audio_file.read() if audio_file else None
+    image_mime = image_file.content_type if image_file else None
+    audio_mime = audio_file.content_type if audio_file else None
+
+    analysis = analyze_crisis_multimodal(
+        notes=notes or "No text notes provided.",
+        image_bytes=image_bytes,
+        image_mime=image_mime,
+        audio_bytes=audio_bytes,
+        audio_mime=audio_mime,
+    )
+
+    location = None
+    if lat is not None and lng is not None:
+        location = {"lat": float(lat), "lng": float(lng)}
+
+    report = storage.create_field_report(
+        {
+            "volunteer_id": volunteer_id,
+            "summary": analysis.get("summary", ""),
+            "severity": _normalize_severity(str(analysis.get("severity", "medium"))),
+            "categories": analysis.get("categories", []),
+            "supply_needs": analysis.get("supply_needs", []),
+            "people_count_estimate": analysis.get("people_count_estimate", 0),
+            "required_volunteers_estimate": analysis.get("required_volunteers_estimate", 0),
+            "location": location,
+            "address": address or volunteer.get("address"),
+            "raw_audio_text": notes,
+            "image_hint": analysis.get("image_hint"),
+        }
+    )
+
+    return {
+        "status": "created",
+        "report": report,
+        "analysis_engine": analysis.get("analysis_engine", "keyword-fallback"),
+        "hotspot_refresh_hint": True,
+    }
+
+
+@router.get("/field-intel/reports")
+def list_field_intel_reports(limit: int = Query(default=25, ge=1, le=100)) -> dict:
+    reports = storage.list_field_reports(limit=limit)
+    return {"reports": reports}
+
+
+@router.post("/ngo/{ngo_id}/needs/{need_id}/autonomous-dispatch")
+def autonomous_dispatch(ngo_id: str, need_id: str) -> dict:
+    need = storage.get_need(need_id)
+    if need is None or need.get("ngo_id") != ngo_id:
+        raise HTTPException(status_code=404, detail="Need not found or access denied.")
+
+    required = int(need.get("required_volunteers", 0))
+    accepted = int(need.get("accepted_count", 0))
+    remaining_slots = max(0, required - accepted)
+    if remaining_slots <= 0:
+        return {
+            "status": "no_action",
+            "message": "Need is already fully staffed.",
+            "need_id": need_id,
+            "remaining_slots": 0,
+        }
+
+    # Agent 1: Analyst
+    analyst_profile = {
+        "required_skills": need.get("required_skills", []),
+        "required_specialists": need.get("required_specialists", []),
+        "job_category": need.get("job_category"),
+        "emergency_level": need.get("emergency_level"),
+        "remaining_slots": remaining_slots,
+    }
+
+    # Agent 2: Dispatcher
+    candidates: list[dict] = []
+    for volunteer in storage.list_volunteers():
+        if need.get("emergency_level") == "emergency" and not volunteer.get("can_handle_emergency", True):
+            continue
+
+        distance_km = _distance_km(volunteer, need)
+        distance_limit = _distance_limit_km(volunteer, need)
+        if distance_km > distance_limit:
+            continue
+
+        capability = _capability_score(volunteer, need)
+        has_constraints = bool(
+            need.get("required_skills")
+            or need.get("required_specialists")
+            or need.get("job_category")
+        )
+        if has_constraints and capability <= 0.0:
+            continue
+
+        has_conflict = any(
+            _needs_time_conflict(need, accepted_need)
+            for accepted_need in _accepted_needs_for_volunteer(volunteer["id"])
+            if accepted_need["id"] != need_id
+        )
+        if has_conflict:
+            continue
+
+        score = _dispatch_score(volunteer, need)
+        candidates.append(
+            {
+                "id": volunteer["id"],
+                "name": volunteer.get("name"),
+                "distance_km": round(distance_km, 2),
+                "capability": round(capability, 4),
+                "dispatch_score": round(score, 4),
+                "job_title": volunteer.get("job_title"),
+                "email": volunteer.get("email"),
+                "phone": volunteer.get("phone"),
+            }
+        )
+
+    candidates.sort(
+        key=lambda item: (
+            item["dispatch_score"],
+            item["capability"],
+            -item["distance_km"],
+        ),
+        reverse=True,
+    )
+    selected = candidates[: max(remaining_slots, 1)]
+
+    # Agent 3: Communicator
+    briefing = build_dispatch_briefing(
+        need_title=str(need.get("title", "NGO Request")),
+        ngo_name=str(need.get("ngo_name", "NGO")),
+        address=need.get("address"),
+        start_time=need.get("start_time"),
+        selected_volunteers=selected,
+        emergency_level=str(need.get("emergency_level", "non_emergency")),
+    )
+
+    for volunteer in selected:
+        channels = ["web"]
+        if volunteer.get("phone"):
+            channels.append("sms")
+        if volunteer.get("email"):
+            channels.append("email")
+        storage.create_notification(
+            volunteer_id=volunteer["id"],
+            need_id=need_id,
+            title=briefing["subject"],
+            message=briefing["briefing"],
+            channels=channels,
+            status="queued",
+        )
+
+    storage.add_need_audit_log(
+        need_id=need_id,
+        action="autonomous_dispatch_queued",
+        actor_id=ngo_id,
+        actor_role="ngo",
+        details={
+            "selected_count": len(selected),
+            "analysis_profile": analyst_profile,
+            "top_candidates": [item["id"] for item in selected[:10]],
+            "engine": briefing.get("engine", "template-fallback"),
+        },
+    )
+
+    return {
+        "status": "queued",
+        "need_id": need_id,
+        "remaining_slots": remaining_slots,
+        "analyst": analyst_profile,
+        "dispatcher": {
+            "candidate_count": len(candidates),
+            "selected": selected,
+        },
+        "communicator": briefing,
+    }
+
+
+@router.get("/ngo/{ngo_id}/needs/{need_id}/volunteers")
+def get_need_volunteer_roster(ngo_id: str, need_id: str):
+    """Return all volunteer applications for a specific need (NGO roster view)."""
+    need = storage.get_need(need_id)
+    if need is None or need.get("ngo_id") != ngo_id:
+        raise HTTPException(status_code=404, detail="Need not found or access denied.")
+    applications = storage.list_need_applications(need_id)
+    return {"need_id": need_id, "applications": applications}
+
+
+@router.delete("/ngo/{ngo_id}/needs/{need_id}/volunteers/{volunteer_id}")
+def remove_volunteer_from_need(ngo_id: str, need_id: str, volunteer_id: str):
+    """NGO removes a volunteer from a need (sets decision to declined)."""
+    need = storage.get_need(need_id)
+    if need is None or need.get("ngo_id") != ngo_id:
+        raise HTTPException(status_code=404, detail="Need not found or access denied.")
+    current_decision = storage.get_volunteer_decision(need_id, volunteer_id)
+    if current_decision is None:
+        raise HTTPException(status_code=404, detail="No application found for this volunteer.")
+    counts = storage.upsert_application(need_id, volunteer_id, "declined", "Removed by NGO coordinator.")
+    storage.add_need_audit_log(
+        need_id=need_id,
+        action="volunteer_removed",
+        actor_id=ngo_id,
+        actor_role="ngo",
+        details={"volunteer_id": volunteer_id, "previous_decision": current_decision},
+    )
+    return {"status": "removed", "volunteer_id": volunteer_id, "need_id": need_id, **counts}

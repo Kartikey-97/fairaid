@@ -1,0 +1,114 @@
+@import "tailwindcss";
+@import "leaflet/dist/leaflet.css";
+
+:root {
+  --bg: #f2f6f7;
+  --bg-grad-start: #f9fcfd;
+  --bg-grad-end: #eaf0f3;
+  --text: #223039;
+  --text-strong: #132027;
+  --text-muted: #60717b;
+  --surface: #ffffff;
+  --surface-elevated: #f3f7f9;
+  --surface-overlay: color-mix(in oklab, var(--surface) 80%, transparent);
+  --surface-overlay-strong: color-mix(in oklab, var(--surface) 92%, transparent);
+  --border: #d3dee3;
+  --brand: #1d7f76;
+  --brand-soft: #d7eeeb;
+  --accent: #d46b56;
+  --accent-soft: #f6e1dc;
+  --success: #2d8f65;
+  --success-soft: #d8f0e3;
+  --pin: #6f69c9;
+  --pin-soft: #e9e8fc;
+  --hero-mask: linear-gradient(
+    135deg,
+    color-mix(in oklab, var(--surface) 88%, transparent),
+    color-mix(in oklab, var(--surface) 70%, var(--brand-soft)) 48%,
+    color-mix(in oklab, var(--surface) 78%, transparent)
+  );
+}
+
+html[data-theme="dark"] {
+  --bg: #0d141a;
+  --bg-grad-start: #131d25;
+  --bg-grad-end: #0b1117;
+  --text: #d1dbe0;
+  --text-strong: #ecf3f6;
+  --text-muted: #98aab4;
+  --surface: #161f27;
+  --surface-elevated: #1c2832;
+  --surface-overlay: color-mix(in oklab, var(--surface) 78%, transparent);
+  --surface-overlay-strong: color-mix(in oklab, var(--surface) 92%, transparent);
+  --border: #2a3944;
+  --brand: #5cbcac;
+  --brand-soft: #1d3d39;
+  --accent: #de7b67;
+  --accent-soft: #3a2723;
+  --success: #56ba8a;
+  --success-soft: #1e3b31;
+  --pin: #8c86dd;
+  --pin-soft: #2d2948;
+  --hero-mask: linear-gradient(
+    135deg,
+    color-mix(in oklab, var(--surface) 66%, transparent),
+    color-mix(in oklab, var(--surface) 78%, var(--brand-soft)) 48%,
+    color-mix(in oklab, var(--surface) 72%, transparent)
+  );
+}
+
+@theme inline {
+  --color-background: var(--bg);
+  --color-foreground: var(--text);
+  --font-sans: var(--font-ui), "Avenir Next", "Segoe UI", "Nunito Sans", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    "Liberation Mono", "Courier New", monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  min-height: 100vh;
+  color: var(--text);
+  font-family: var(--font-ui), "Avenir Next", "Segoe UI", "Nunito Sans", sans-serif;
+  background:
+    radial-gradient(circle at 8% 10%, color-mix(in oklab, var(--brand) 17%, transparent), transparent 31%),
+    radial-gradient(circle at 92% 9%, color-mix(in oklab, var(--accent) 14%, transparent), transparent 29%),
+    radial-gradient(circle at 48% 100%, color-mix(in oklab, var(--brand) 9%, transparent), transparent 40%),
+    linear-gradient(180deg, var(--bg-grad-start), var(--bg-grad-end));
+  transition: background-color 220ms ease, color 220ms ease, background-image 220ms ease;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  font-family: var(--font-display), "Iowan Old Style", "Palatino Linotype", "Book Antiqua", serif;
+  letter-spacing: -0.014em;
+}
+
+::selection {
+  background: color-mix(in oklab, var(--brand) 34%, white);
+  color: #102026;
+}
+
+html[data-theme="dark"] ::selection {
+  background: color-mix(in oklab, var(--brand) 40%, black);
+  color: #f2fbff;
+}
+
+@keyframes ambientShift {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  50% {
+    transform: translate3d(0, -8px, 0) scale(1.015);
+  }
+}
+
+.ambient-shift {
+  animation: ambientShift 8s ease-in-out infinite;
+}

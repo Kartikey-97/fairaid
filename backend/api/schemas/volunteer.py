@@ -14,7 +14,25 @@ WeekDay = Literal["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
 
 UserRole = Literal["ngo", "volunteer"]
-VolunteerDecision = Literal["accepted", "interested", "declined"]
+VolunteerDecision = Literal["accepted", "pinned", "interested", "declined"]
+
+SPECIALIST_ALIAS_MAP = {
+    "doctor": "medical",
+    "nurse": "medical",
+    "paramedic": "medical",
+    "surgeon": "medical",
+    "pharmacist": "medical",
+    "physiotherapist": "medical",
+    "public-health": "public-health",
+    "educator": "education",
+    "teacher": "education",
+    "counselor": "counseling",
+    "psychologist": "counseling",
+    "mental-health": "counseling",
+    "lawyer": "legal-aid",
+    "legal": "legal-aid",
+    "vet": "veterinary",
+}
 
 
 class Coordinate(BaseModel):
@@ -116,13 +134,21 @@ class VolunteerRegisterRequest(BaseModel):
     @field_validator("specialist_domains")
     @classmethod
     def _validate_specialist_domains(cls, value: list[str]) -> list[str]:
-        invalid = sorted({item for item in value if item not in SPECIALIST_LIBRARY})
+        normalized: list[str] = []
+        for item in value:
+            canonical = item.strip().lower().replace("_", "-").replace(" ", "-")
+            canonical = SPECIALIST_ALIAS_MAP.get(canonical, canonical)
+            if canonical:
+                normalized.append(canonical)
+
+        invalid = sorted({item for item in normalized if item not in SPECIALIST_LIBRARY})
         if invalid:
             raise ValueError(
                 f"Unknown specialist domains: {', '.join(invalid)}. "
                 f"Allowed values: {', '.join(SPECIALIST_LIBRARY)}"
             )
-        return value
+        deduped = list(dict.fromkeys(normalized))
+        return deduped
 
     @field_validator("languages")
     @classmethod
