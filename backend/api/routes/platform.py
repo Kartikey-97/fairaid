@@ -41,6 +41,10 @@ from backend.core.domain import (
 from backend.core.ai import analyze_crisis_multimodal, build_dispatch_briefing
 from backend.models.need_prediction import SemanticMatcher
 
+from backend.core.matching.allocator import _pair_score        # dynamic score
+from backend.core.fairness.optimizer import optimize_fairness  # fairness pass
+from backend.core.fairness.objective import evaluate_state     # metrics
+
 router = APIRouter(prefix="/platform", tags=["platform"])
 SEMANTIC_MATCHER = SemanticMatcher()
 ROUTING_DISABLED_UNTIL = 0.0
@@ -427,18 +431,25 @@ def _normalize_severity(value: str) -> str:
 
 
 def _dispatch_score(volunteer: dict, need: dict) -> float:
-    distance_km = _distance_km(volunteer, need)
-    distance_limit = _distance_limit_km(volunteer, need)
-    distance_norm = _clamp01(distance_km / max(distance_limit, 1.0))
-    distance_priority = 1.0 - distance_norm
-
-    capability = _capability_score(volunteer, need)
-    semantic = SEMANTIC_MATCHER.similarity(
-        _volunteer_semantic_text(volunteer),
-        _needs_semantic_text(need),
-    )
-    score = (0.5 * distance_priority) + (0.35 * capability) + (0.15 * semantic)
-    return _clamp01(score)
+    """
+    Replace the old fixed-weight score (0.5 distance + 0.35 capability + 0.15
+    semantic) with a principled, urgency-aware version.
+ 
+    Weights are derived from the need's urgency level and emergency status
+    rather than being hardcoded constants:
+ 
+      Emergency / urgency=5  →  60% distance, 30% capability, 10% semantic
+      Urgency=4              →  45% distance, 40% capability, 15% semantic
+      High impact            →  30% distance, 50% capability, 20% semantic
+      Routine                →  25% distance, 55% capability, 20% semantic
+ 
+    Uses the same _pair_score helper as the allocator so both code paths are
+    consistent.
+    """
+    # Import here to avoid circular import; in production move to module top.
+    from backend.core.matching.allocator import _pair_score as _compute_pair_score
+    return _compute_pair_score(volunteer, need)
+ 
 
 
 def _draft_need_from_text(text: str) -> NeedDraftResponse:
@@ -1182,14 +1193,28 @@ def list_field_intel_reports(limit: int = Query(default=25, ge=1, le=100)) -> di
 
 
 @router.post("/ngo/{ngo_id}/needs/{need_id}/autonomous-dispatch")
-def autonomous_dispatch(ngo_id: str, need_id: str) -> dict:
+def autonomous_dispatch_improved(ngo_id: str, need_id: str) -> dict:
+    """
+    Drop-in replacement for the autonomous_dispatch endpoint handler.
+ 
+    Wire it up in platform.py like this:
+ 
+        @router.post("/ngo/{ngo_id}/needs/{need_id}/autonomous-dispatch")
+        def autonomous_dispatch(ngo_id: str, need_id: str) -> dict:
+            return autonomous_dispatch_improved(ngo_id, need_id)
+    """
+    from fastapi import HTTPException
+    from backend.core.pipeline.run_allocation import run_allocation as pipeline_run
+    from backend.core.ai import build_dispatch_briefing
+ 
     need = storage.get_need(need_id)
     if need is None or need.get("ngo_id") != ngo_id:
         raise HTTPException(status_code=404, detail="Need not found or access denied.")
-
+ 
     required = int(need.get("required_volunteers", 0))
     accepted = int(need.get("accepted_count", 0))
     remaining_slots = max(0, required - accepted)
+ 
     if remaining_slots <= 0:
         return {
             "status": "no_action",
@@ -1197,8 +1222,8 @@ def autonomous_dispatch(ngo_id: str, need_id: str) -> dict:
             "need_id": need_id,
             "remaining_slots": 0,
         }
-
-    # Agent 1: Analyst
+ 
+    # ── Analyst: profile the need ────────────────────────────────────────────
     analyst_profile = {
         "required_skills": need.get("required_skills", []),
         "required_specialists": need.get("required_specialists", []),
@@ -1206,60 +1231,119 @@ def autonomous_dispatch(ngo_id: str, need_id: str) -> dict:
         "emergency_level": need.get("emergency_level"),
         "remaining_slots": remaining_slots,
     }
-
-    # Agent 2: Dispatcher
-    candidates: list[dict] = []
+ 
+    # ── Collect candidate volunteers ─────────────────────────────────────────
+    raw_volunteers: list[dict] = []
     for volunteer in storage.list_volunteers():
         if need.get("emergency_level") == "emergency" and not volunteer.get("can_handle_emergency", True):
             continue
-
+ 
         distance_km = _distance_km(volunteer, need)
         distance_limit = _distance_limit_km(volunteer, need)
         if distance_km > distance_limit:
             continue
-
+ 
         capability = _capability_score(volunteer, need)
         has_constraints = bool(
-            need.get("required_skills")
-            or need.get("required_specialists")
-            or need.get("job_category")
+            need.get("required_skills") or need.get("required_specialists") or need.get("job_category")
         )
         if has_constraints and capability <= 0.0:
             continue
-
+ 
         has_conflict = any(
-            _needs_time_conflict(need, accepted_need)
-            for accepted_need in _accepted_needs_for_volunteer(volunteer["id"])
-            if accepted_need["id"] != need_id
+            _needs_time_conflict(need, an)
+            for an in _accepted_needs_for_volunteer(volunteer["id"])
+            if an["id"] != need_id
         )
         if has_conflict:
             continue
-
-        score = _dispatch_score(volunteer, need)
-        candidates.append(
-            {
-                "id": volunteer["id"],
-                "name": volunteer.get("name"),
-                "distance_km": round(distance_km, 2),
-                "capability": round(capability, 4),
-                "dispatch_score": round(score, 4),
-                "job_title": volunteer.get("job_title"),
-                "email": volunteer.get("email"),
-                "phone": volunteer.get("phone"),
-            }
-        )
-
-    candidates.sort(
-        key=lambda item: (
-            item["dispatch_score"],
-            item["capability"],
-            -item["distance_km"],
-        ),
-        reverse=True,
+ 
+        raw_volunteers.append(volunteer)
+ 
+    if not raw_volunteers:
+        return {
+            "status": "no_action",
+            "message": "No eligible volunteers found within constraints.",
+            "need_id": need_id,
+            "remaining_slots": remaining_slots,
+            "analyst": analyst_profile,
+        }
+ 
+    # ── Run Hungarian allocation on the target need + all other open needs ───
+    # This ensures the fairness pass has the full picture, not just one need.
+    all_open_needs = storage.list_needs(status="open")
+ 
+    # Shape needs for the allocator (it expects "required" and "skills_required")
+    def _shape_need(n: dict) -> dict:
+        return {
+            **n,
+            "required": int(n.get("required_volunteers", 1)) - int(n.get("accepted_count", 0)),
+            "skills_required": n.get("required_skills", []),
+            "is_critical": bool(n.get("is_critical", False)),
+        }
+ 
+    shaped_needs = [_shape_need(n) for n in all_open_needs if int(n.get("required_volunteers", 1)) - int(n.get("accepted_count", 0)) > 0]
+    shaped_volunteers = [
+        {
+            **v,
+            "availability": True,
+            "max_travel_km": float(v.get("radius_km", 25)),
+        }
+        for v in raw_volunteers
+    ]
+ 
+    # Use the full pipeline (Hungarian + fairness optimizer at lambda=0.5)
+    pipeline_result = pipeline_run(shaped_volunteers, shaped_needs)
+    # lambda=0.5 balances efficiency and fairness
+    best_state = pipeline_result["states"].get("0.5") or pipeline_result["states"].get("0")
+ 
+    # ── Extract volunteers assigned to THIS need ──────────────────────────────
+    target_state_need = next(
+        (n for n in (best_state.get("needs") or []) if str(n.get("id")) == need_id),
+        None,
     )
-    selected = candidates[: max(remaining_slots, 1)]
-
-    # Agent 3: Communicator
+    assigned_vol_ids: list[str] = list(target_state_need.get("assigned_volunteers", [])) if target_state_need else []
+ 
+    # Build the selected candidate list with metadata for the communicator
+    selected: list[dict] = []
+    for vol_id in assigned_vol_ids[:remaining_slots]:
+        vol = storage.get_volunteer(vol_id)
+        if vol is None:
+            continue
+        score = _dispatch_score(vol, need)
+        selected.append({
+            "id": vol_id,
+            "name": vol.get("name"),
+            "distance_km": round(_distance_km(vol, need), 2),
+            "capability": round(_capability_score(vol, need), 4),
+            "dispatch_score": round(score, 4),
+            "job_title": vol.get("job_title"),
+            "email": vol.get("email"),
+            "phone": vol.get("phone"),
+        })
+ 
+    # Fallback: if pipeline assigned nothing, fall back to greedy top-K
+    if not selected:
+        scored_candidates = sorted(
+            [
+                {
+                    "id": v["id"],
+                    "name": v.get("name"),
+                    "distance_km": round(_distance_km(v, need), 2),
+                    "capability": round(_capability_score(v, need), 4),
+                    "dispatch_score": round(_dispatch_score(v, need), 4),
+                    "job_title": v.get("job_title"),
+                    "email": v.get("email"),
+                    "phone": v.get("phone"),
+                }
+                for v in raw_volunteers
+            ],
+            key=lambda c: (c["dispatch_score"], c["capability"], -c["distance_km"]),
+            reverse=True,
+        )
+        selected = scored_candidates[:max(remaining_slots, 1)]
+ 
+    # ── Communicator: AI briefing ─────────────────────────────────────────────
     briefing = build_dispatch_briefing(
         need_title=str(need.get("title", "NGO Request")),
         ngo_name=str(need.get("ngo_name", "NGO")),
@@ -1268,22 +1352,29 @@ def autonomous_dispatch(ngo_id: str, need_id: str) -> dict:
         selected_volunteers=selected,
         emergency_level=str(need.get("emergency_level", "non_emergency")),
     )
-
-    for volunteer in selected:
+ 
+    # ── Notify selected volunteers ────────────────────────────────────────────
+    for vol in selected:
+        volunteer = storage.get_volunteer(vol["id"])
+        if volunteer is None:
+            continue
         channels = ["web"]
         if volunteer.get("phone"):
             channels.append("sms")
         if volunteer.get("email"):
             channels.append("email")
         storage.create_notification(
-            volunteer_id=volunteer["id"],
+            volunteer_id=vol["id"],
             need_id=need_id,
             title=briefing["subject"],
             message=briefing["briefing"],
             channels=channels,
             status="queued",
         )
-
+ 
+    # ── Fairness metrics from the pipeline ────────────────────────────────────
+    fairness_metrics = best_state.get("metrics") if best_state else None
+ 
     storage.add_need_audit_log(
         need_id=need_id,
         action="autonomous_dispatch_queued",
@@ -1294,21 +1385,25 @@ def autonomous_dispatch(ngo_id: str, need_id: str) -> dict:
             "analysis_profile": analyst_profile,
             "top_candidates": [item["id"] for item in selected[:10]],
             "engine": briefing.get("engine", "template-fallback"),
+            "algorithm": "hungarian" if len(shaped_volunteers) > 1 else "greedy-fallback",
+            "fairness_lambda": 0.5,
+            "fairness_metrics": fairness_metrics,
         },
     )
-
+ 
     return {
         "status": "queued",
         "need_id": need_id,
         "remaining_slots": remaining_slots,
         "analyst": analyst_profile,
         "dispatcher": {
-            "candidate_count": len(candidates),
+            "algorithm": "hungarian+fairness",
+            "candidate_count": len(raw_volunteers),
             "selected": selected,
         },
         "communicator": briefing,
+        "fairness": fairness_metrics,
     }
-
 
 @router.get("/ngo/{ngo_id}/needs/{need_id}/volunteers")
 def get_need_volunteer_roster(ngo_id: str, need_id: str):
