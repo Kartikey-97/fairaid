@@ -45,6 +45,7 @@ export default function AccessibilityPage() {
   const [history, setHistory] = useState<string[]>([]);
   const [manualPhrase, setManualPhrase] = useState("");
   const [isSending, setIsSending] = useState(false);
+  const [cameraFacingMode, setCameraFacingMode] = useState<'environment' | 'user'>('environment');
   const [sendStatus, setSendStatus] = useState<string | null>(null);
 
   const legend = useMemo(
@@ -106,12 +107,14 @@ export default function AccessibilityPage() {
   async function startCamera() {
     try {
       setIsStarting(true);
+    // Ensure camera facing mode is respected on start
+    // No additional code needed here
       setStatus("Loading offline model...");
       const recognizer = await ensureRecognizer();
 
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: 960, height: 540, facingMode: "environment" },
-      });
+          video: { width: 960, height: 540, facingMode: cameraFacingMode },
+        });
       streamRef.current = stream;
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
@@ -227,16 +230,22 @@ export default function AccessibilityPage() {
             <video ref={videoRef} className="h-[360px] w-full object-cover" muted playsInline />
           </div>
           <div className="mt-3 flex flex-wrap gap-2">
-            {!isRunning ? (
-              <Button onClick={startCamera} disabled={isStarting}>
-                {isStarting ? "Starting..." : "Start Translator"}
-              </Button>
-            ) : (
-              <Button variant="danger" onClick={stopCamera}>Stop Translator</Button>
-            )}
-            <Button variant="secondary" onClick={sendSignalToNgo} disabled={isSending || !volunteer}>
-              {isSending ? "Sending..." : "Send Signal to NGO"}
+            {/* Camera control buttons */}
+          {isRunning ? (
+            <Button variant="danger" onClick={stopCamera}>Stop Translator</Button>
+          ) : (
+            <Button onClick={startCamera} disabled={isStarting}>
+              {isStarting ? "Starting..." : "Start Translator"}
             </Button>
+          )}
+          {/* Flip Camera button */}
+          <Button variant="secondary" onClick={() => setCameraFacingMode(prev => prev === "environment" ? "user" : "environment")} disabled={isStarting}>
+            Flip Camera
+          </Button>
+          {/* Send Signal button */}
+          <Button variant="secondary" onClick={sendSignalToNgo} disabled={isSending || !volunteer}>
+            {isSending ? "Sending..." : "Send Signal to NGO"}
+          </Button>
           </div>
           <p className="mt-2 text-xs text-[var(--text-muted)]">Status: {status}</p>
           {sendStatus ? <p className="mt-2 text-xs text-[var(--text-muted)]">{sendStatus}</p> : null}
