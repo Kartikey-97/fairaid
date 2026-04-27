@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import dynamic from "next/dynamic";
 
 import {
   ApiError,
@@ -26,6 +27,16 @@ import type {
 import { Timeline } from "@/components/gantt/Timeline";
 import { Button } from "@/components/ui/Button";
 import { Card } from "@/components/ui/Card";
+
+const VolunteerEventsMap = dynamic(
+  () => import("@/components/maps/VolunteerEventsMap").then((mod) => mod.VolunteerEventsMap),
+  {
+    ssr: false,
+    loading: () => (
+      <div className="h-72 w-full animate-pulse rounded-xl border border-[var(--border)] bg-[var(--surface-elevated)]" />
+    ),
+  },
+);
 
 type CachedDecision = {
   need_id: string;
@@ -63,6 +74,14 @@ function getTimeBucket(value?: string): TimingFilter {
   if (hour >= 12 && hour < 17) return "afternoon";
   return "evening";
 }
+
+const SCORE_BREAKDOWN_LABELS: Record<string, string> = {
+  semantic: "Profile Similarity",
+  skill: "Required Skills Coverage",
+  specialist: "Specialist Fit",
+  job_match: "Role Alignment",
+  distance_priority: "Distance Advantage",
+};
 
 function TaskCard({
   item,
@@ -258,7 +277,7 @@ export default function VolunteerPage() {
       const profile = await fetchVolunteerByUser(session.user_id);
       if (!mountedRef.current) return;
       setVolunteer(profile);
-      setMaxDistanceFilter(Math.max(5, Math.round(profile.radius_km || 25)));
+      setMaxDistanceFilter(Math.min(100, Math.max(5, Math.round(profile.radius_km || 25))));
       writeCached(profileCacheKey, profile);
 
       const [newFeed, hot] = await Promise.all([
@@ -286,7 +305,7 @@ export default function VolunteerPage() {
       const cachedHotspots = readCached<HotspotsResponse>(hotspotCacheKey);
       if (cachedProfile?.data) {
         setVolunteer(cachedProfile.data);
-        setMaxDistanceFilter(Math.max(5, Math.round(cachedProfile.data.radius_km || 25)));
+        setMaxDistanceFilter(Math.min(100, Math.max(5, Math.round(cachedProfile.data.radius_km || 25))));
       }
       if (cachedFeed?.data) setFeed(cachedFeed.data);
       if (cachedHotspots?.data) setHotspots(cachedHotspots.data);
@@ -355,7 +374,7 @@ export default function VolunteerPage() {
   const timelineItems = useMemo(() => {
     if (!feed) return [];
     return feed.all
-      .filter((item) => item.user_decision === "accepted")
+      .filter((item) => item.user_decision === "accepted" || item.user_decision === "interested")
       .slice(0, 8)
       .map((item, index) => ({
         id: item.need_id,
@@ -363,6 +382,7 @@ export default function VolunteerPage() {
         start: toTimeLabel(item.shift_start),
         end: toTimeLabel(item.shift_end),
         color: index % 2 === 0 ? "#2f91a8" : "#69a97e",
+        status: item.user_decision,
       }));
   }, [feed]);
 
@@ -372,6 +392,11 @@ export default function VolunteerPage() {
   const needTypeOptions = useMemo(() => {
     if (!feed) return [];
     return Array.from(new Set(feed.all.map((item) => item.need_type))).sort();
+  }, [feed]);
+
+  const mapItems = useMemo(() => {
+    if (!feed) return [];
+    return feed.all;
   }, [feed]);
 
   const filteredTasks = useMemo(() => {
@@ -487,7 +512,7 @@ export default function VolunteerPage() {
         <div className="relative grid gap-4 lg:grid-cols-[1.35fr_1fr]">
           <div>
             <p className="text-sm font-semibold text-[var(--brand)]">Welcome back, {volunteer.name.split(" ")[0]}!</p>
-            <h1 className="mt-2 text-4xl leading-tight text-[var(--text-strong)]">Ready to make a difference today?</h1>
+            <h1 className="mt-2 text-4xl leading-tight text-[var(--text-strong)] [font-variant-ligatures:none]">Ready to make a difference today?</h1>
             <p className="mt-3 text-sm text-[var(--text-muted)]">Distance-first matching with skill and specialist fit.</p>
             <div className="mt-5 flex flex-wrap gap-3">
               <Button
@@ -536,6 +561,16 @@ export default function VolunteerPage() {
         </Card>
       )}
 
+      {/* Confirmed commitments */}
+      <Card>
+        <h2 className="text-xl text-[var(--text-strong)]">Confirmed Commitments</h2>
+        {timelineItems.length ? (
+          <div className="mt-3"><Timeline title="Committed Shift Timeline" items={timelineItems} /></div>
+        ) : (
+          <p className="mt-3 text-sm text-[var(--text-muted)]">No committed shifts yet.</p>
+        )}
+      </Card>
+
       {/* Hotspots */}
       {hotspots && hotspots.urgent_categories.length > 0 && (
         <Card>
@@ -555,6 +590,15 @@ export default function VolunteerPage() {
                 </div>
               );
             })}
+          </div>
+          <div className="mt-4">
+            <p className="mb-2 text-xs text-[var(--text-muted)]">
+              Pin legend:
+              <span className="ml-2 font-semibold text-[var(--accent)]">Red emergency</span>
+              <span className="ml-2 font-semibold text-[var(--success)]">Green nearby match</span>
+              <span className="ml-2 font-semibold text-[var(--brand)]">Blue other open tasks</span>
+            </p>
+            <VolunteerEventsMap items={mapItems} />
           </div>
         </Card>
       )}
@@ -581,12 +625,12 @@ export default function VolunteerPage() {
               <label className="space-y-1 text-xs">
                 <span>Search</span>
                 <input value={searchFilter} onChange={(e) => setSearchFilter(e.target.value)} placeholder="title / ngo / type"
-                  className="w-full rounded-xl border border-[var(--border)] bg-[var(--surface-elevated)] px-3 py-2 text-sm" />
+                  className="h-10 w-full rounded-xl border border-[var(--border)] bg-[var(--surface-elevated)] px-3 py-2 text-sm" />
               </label>
               <label className="space-y-1 text-xs">
                 <span>Work Type</span>
                 <select value={typeFilter} onChange={(e) => setTypeFilter(e.target.value)}
-                  className="w-full rounded-xl border border-[var(--border)] bg-[var(--surface-elevated)] px-3 py-2 text-sm">
+                  className="h-10 w-full rounded-xl border border-[var(--border)] bg-[var(--surface-elevated)] px-3 py-2 text-sm">
                   <option value="all">All</option>
                   {needTypeOptions.map((t) => <option key={t} value={t}>{t}</option>)}
                 </select>
@@ -594,7 +638,7 @@ export default function VolunteerPage() {
               <label className="space-y-1 text-xs">
                 <span>Timing</span>
                 <select value={timingFilter} onChange={(e) => setTimingFilter(e.target.value as TimingFilter)}
-                  className="w-full rounded-xl border border-[var(--border)] bg-[var(--surface-elevated)] px-3 py-2 text-sm">
+                  className="h-10 w-full rounded-xl border border-[var(--border)] bg-[var(--surface-elevated)] px-3 py-2 text-sm">
                   <option value="any">Any</option>
                   <option value="morning">Morning</option>
                   <option value="afternoon">Afternoon</option>
@@ -604,11 +648,11 @@ export default function VolunteerPage() {
               <label className="space-y-1 text-xs">
                 <span>Location</span>
                 <input value={locationFilter} onChange={(e) => setLocationFilter(e.target.value)} placeholder="city / area"
-                  className="w-full rounded-xl border border-[var(--border)] bg-[var(--surface-elevated)] px-3 py-2 text-sm" />
+                  className="h-10 w-full rounded-xl border border-[var(--border)] bg-[var(--surface-elevated)] px-3 py-2 text-sm" />
               </label>
               <label className="space-y-1 text-xs">
                 <span>Max Distance ({maxDistanceFilter} km)</span>
-                <input type="range" min={1} max={Math.max(10, Math.round(volunteer.radius_km || 25))}
+                <input type="range" min={1} max={100}
                   value={maxDistanceFilter} onChange={(e) => setMaxDistanceFilter(Number(e.target.value))} className="w-full" />
               </label>
             </div>
@@ -662,16 +706,6 @@ export default function VolunteerPage() {
         </>
       )}
 
-      {/* Timeline */}
-      <Card>
-        <h2 className="text-xl text-[var(--text-strong)]">Confirmed Commitments</h2>
-        {timelineItems.length ? (
-          <div className="mt-3"><Timeline title="Committed Shift Timeline" items={timelineItems} /></div>
-        ) : (
-          <p className="mt-3 text-sm text-[var(--text-muted)]">No committed shifts yet.</p>
-        )}
-      </Card>
-
       {/* Detail modal */}
       {selectedNeed && (
         <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/30 p-3 sm:items-center">
@@ -692,16 +726,43 @@ export default function VolunteerPage() {
               <p className="text-sm text-[var(--text-muted)]">{selectedNeed.need_address ?? "Address unavailable"}</p>
               <p className="text-sm text-[var(--text-muted)]">Distance: {selectedNeed.distance_km} km • Fit: {fitPercent(selectedNeed.recommendation_score)}</p>
               <p className="text-sm text-[var(--text-muted)]">Shift: {toTimeLabel(selectedNeed.shift_start)} - {toTimeLabel(selectedNeed.shift_end)}</p>
+              
               <div className="flex flex-wrap gap-2">
                 {selectedNeed.required_skills.slice(0, 8).map((skill) => (
                   <span key={skill} className="rounded-full bg-[var(--surface-elevated)] px-2.5 py-1 text-xs font-semibold text-[var(--text-muted)]">{skill}</span>
                 ))}
               </div>
+
+              {selectedNeed.score_breakdown && Object.keys(selectedNeed.score_breakdown).length > 0 && (
+                <details className="group rounded-xl border border-[var(--border)] bg-[var(--surface-elevated)]">
+                  <summary className="flex cursor-pointer items-center justify-between p-3 text-sm font-semibold text-[var(--text-strong)] hover:text-[var(--brand)]">
+                    Why this match?
+                    <svg className="h-4 w-4 transition-transform group-open:rotate-180" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                    </svg>
+                  </summary>
+                  <div className="border-t border-[var(--border)] p-3 text-xs text-[var(--text-muted)]">
+                    <p className="mb-2 text-[11px] text-[var(--text-muted)]">
+                      These factors explain why this opportunity appears in your recommendations.
+                    </p>
+                    <ul className="space-y-1.5">
+                      {Object.entries(selectedNeed.score_breakdown).map(([key, value]) => (
+                        <li key={key} className="flex justify-between">
+                          <span>{SCORE_BREAKDOWN_LABELS[key] ?? key.replace(/_/g, " ")}</span>
+                          <span className="font-medium text-[var(--text-strong)]">{(value * 100).toFixed(1)}%</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                </details>
+              )}
+
               {selectedNeed.need_location && (
                 <div className="overflow-hidden rounded-xl border border-[var(--border)]">
                   <iframe title={`${selectedNeed.title} map`} src={buildMapEmbedUrl(selectedNeed.need_location.lat, selectedNeed.need_location.lng)} className="h-56 w-full" loading="lazy" />
                 </div>
               )}
+
               <div className="grid grid-cols-3 gap-2">
                 <Button variant="secondary" onClick={() => handleDecision(selectedNeed.need_id, "pinned")} disabled={isUpdatingDecision}>Pin</Button>
                 <Button onClick={() => handleDecision(selectedNeed.need_id, "accepted")} disabled={isUpdatingDecision}>I&apos;m In</Button>

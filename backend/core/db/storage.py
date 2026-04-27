@@ -267,6 +267,8 @@ def _ensure_column(cursor, table: str, column: str, column_def: str) -> None:
         _execute(cursor, f"ALTER TABLE {table} ADD COLUMN {column} {column_def}")
 
 
+import bcrypt
+
 def initialize_database() -> None:
     with get_connection() as connection:
         cursor = connection.cursor()
@@ -460,6 +462,31 @@ def initialize_database() -> None:
             cursor,
             "UPDATE applications SET decision = 'pinned' WHERE decision = 'interested'",
         )
+        _execute(
+            cursor,
+            """
+            CREATE TABLE IF NOT EXISTS sessions (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                token TEXT NOT NULL UNIQUE,
+                expires_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users (id)
+            )
+            """,
+        )
+
+        # Migrate existing plain-text passwords to bcrypt hashes
+        try:
+            users_query = _execute(cursor, "SELECT id, password FROM users").fetchall()
+            for row in users_query:
+                uid = _row_get(row, "id")
+                pwd = _row_get(row, "password")
+                if pwd and not pwd.startswith("$2"):
+                    hashed = bcrypt.hashpw(pwd.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+                    _execute(cursor, "UPDATE users SET password = ? WHERE id = ?", (hashed, uid))
+        except Exception as e:
+            print(f"Password migration note: {e}")
+
         connection.commit()
 
     _seed_dummy_data_if_empty()
@@ -871,6 +898,10 @@ def _seed_supplemental_demo_data() -> None:
 def create_user(name: str, email: str, password: str, role: str) -> dict:
     user_id = f"user_{uuid4().hex[:12]}"
     timestamp = _now_iso()
+    
+    # Hash password using bcrypt
+    password_hash = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+    
     with get_connection() as connection:
         cursor = connection.cursor()
         existing = _execute(
@@ -887,7 +918,7 @@ def create_user(name: str, email: str, password: str, role: str) -> dict:
             INSERT INTO users (id, role, name, email, password, created_at)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (user_id, role, name, email, password, timestamp),
+            (user_id, role, name, email, password_hash, timestamp),
         )
         connection.commit()
     return {
@@ -904,16 +935,32 @@ def authenticate_user(email: str, password: str, role: str | None = None) -> dic
         row = _execute(
             cursor,
             """
-            SELECT id, role, name, email
+            SELECT id, role, name, email, password
             FROM users
-            WHERE lower(email) = lower(?) AND password = ?
+            WHERE lower(email) = lower(?)
             """,
-            (email, password),
+            (email,),
         ).fetchone()
+        
         if row is None:
             return None
+            
+        stored_password = _row_get(row, "password")
+        
+        # Verify bcrypt hash. Note: fallback to plain text if the user hasn't been migrated yet (for hackathon smooth transition)
+        is_valid = False
+        try:
+            is_valid = bcrypt.checkpw(password.encode('utf-8'), stored_password.encode('utf-8'))
+        except ValueError:
+            # If stored password is not a valid bcrypt hash, compare plain text
+            is_valid = (password == stored_password)
+            
+        if not is_valid:
+            return None
+            
         if role and _row_get(row, "role") != role:
             return None
+            
         return {
             "id": _row_get(row, "id"),
             "role": _row_get(row, "role"),
@@ -1532,6 +1579,25 @@ def list_field_reports(limit: int = 50) -> list[dict]:
     return [_field_report_from_row(row) for row in rows]
 
 
+def delete_field_report(report_id: str) -> bool:
+    with get_connection() as connection:
+        cursor = connection.cursor()
+        existing = _execute(
+            cursor,
+            "SELECT id FROM field_reports WHERE id = ?",
+            (report_id,),
+        ).fetchone()
+        if existing is None:
+            return False
+        _execute(
+            cursor,
+            "DELETE FROM field_reports WHERE id = ?",
+            (report_id,),
+        )
+        connection.commit()
+        return True
+
+
 def _application_counts(need_id: str) -> dict:
     with get_connection() as connection:
         cursor = connection.cursor()
@@ -1980,6 +2046,58 @@ def _seed_extra_demo_volunteers() -> None:
              _to_json({"name": "Anika Singh", "phone": "+91-9876543210"}),
              "Ensure water is chlorinated.", "Tablets and hygiene kits provided.",
              "Meet at main entrance 08:45.", "open", _to_json([])),
+            ("need_demo_007", "user_ngo_demo", "Sahara Community Relief",
+             "Yamuna Flood Evacuation Support — ITO Belt",
+             "Rapid evacuation support required for families stuck near low-lying riverbank clusters.",
+             "evacuation", "operations volunteer", "emergency", 1, 5, 5, 30,
+             _to_json(["disaster response","crowd management","driving"]),
+             _to_json(["disaster-management","communications"]),
+             _to_json(["hindi","english"]),
+             18, 0, 260, 45.0, 28.6289, 77.2426,
+             "Temporary Transit Camp, ITO, New Delhi",
+             "2026-04-28T06:00:00+05:30", "2026-04-28T18:30:00+05:30",
+             _to_json({"name": "Rahul Anand", "phone": "+91-9001122334"}),
+             "Life jackets mandatory near flood zone.", "Boats, buses and first aid van available.",
+             "Batch briefing every 45 minutes.", "open", _to_json([])),
+            ("need_demo_008", "user_ngo_demo", "Sahara Community Relief",
+             "Animal Rescue and Vet Support — Noida Extension",
+             "Companion animals and livestock displaced after heavy rains. Need rescue and veterinary triage.",
+             "animal-rescue", "veterinarian", "non_emergency", 0, 4, 4, 10,
+             _to_json(["animal rescue","veterinary support","community outreach"]),
+             _to_json(["veterinary"]),
+             _to_json(["hindi"]),
+             None, 0, 95, 22.0, 28.5709, 77.3665,
+             "Gaushala Transit Point, Noida Extension",
+             "2026-04-29T08:30:00+05:30", "2026-04-29T16:00:00+05:30",
+             _to_json({"name": "Farah Khan", "phone": "+91-9223344556"}),
+             "Use gloves while handling injured animals.", "Vet kits and cages arranged on site.",
+             "Register each rescued animal at entry desk.", "open", _to_json([])),
+            ("need_demo_009", "user_ngo_demo", "Sahara Community Relief",
+             "Night Community Kitchen — Seemapuri",
+             "Set up and run a nightly kitchen for migrant families impacted by disruption in wage work.",
+             "food-distribution", "operations volunteer", "non_emergency", 0, 3, 4, 20,
+             _to_json(["food distribution","logistics","beneficiary registration"]),
+             _to_json(["logistics"]),
+             _to_json(["hindi","urdu"]),
+             None, 0, 420, 18.0, 28.6844, 77.3270,
+             "Ward Community Hall, Seemapuri",
+             "2026-04-28T18:00:00+05:30", "2026-04-29T00:30:00+05:30",
+             _to_json({"name": "Jatin Batra", "phone": "+91-9445566778"}),
+             "Food hygiene and queue protocol required.", "Dry ration and cookware available.",
+             "Shift handover at 21:00.", "open", _to_json([])),
+            ("need_demo_010", "user_ngo_demo", "Sahara Community Relief",
+             "Mobile Medical Transport Coordination — East Delhi",
+             "Need drivers and dispatch support for transporting patients to partner hospitals.",
+             "medical-transport", "ambulance driver", "emergency", 0, 5, 5, 14,
+             _to_json(["driving","ambulance coordination","communications"]),
+             _to_json(["medical","communications"]),
+             _to_json(["hindi","english"]),
+             21, 1, 70, 35.0, 28.6519, 77.3075,
+             "Dispatch Base, Laxmi Nagar",
+             "2026-04-28T07:00:00+05:30", "2026-04-28T22:00:00+05:30",
+             _to_json({"name": "Neeraj Sethi", "phone": "+91-9778899001"}),
+             "Drive only on assigned route; maintain patient logs.", "Fuel cards and stretcher support available.",
+             "Dispatch desk inside base office.", "open", _to_json([])),
         ]
         for n in extra_needs:
             if _execute(cursor, "SELECT id FROM needs WHERE id = ?", (n[0],)).fetchone() is None:
@@ -1999,6 +2117,14 @@ def _seed_extra_demo_volunteers() -> None:
             ("app_demo_016", "need_demo_005", "vol_demo_005", "accepted", "Logistics support."),
             ("app_demo_017", "need_demo_006", "vol_demo_008", "accepted", "Public health doctor."),
             ("app_demo_018", "need_demo_006", "vol_demo_001", "pinned",   "Available if backup needed."),
+            ("app_demo_019", "need_demo_007", "vol_demo_007", "accepted", "Can manage evacuation buses."),
+            ("app_demo_020", "need_demo_007", "vol_demo_005", "accepted", "Logistics + crowd routing."),
+            ("app_demo_021", "need_demo_007", "vol_demo_010", "pinned",   "Can assist with translation if needed."),
+            ("app_demo_022", "need_demo_008", "vol_demo_010", "accepted", "Can coordinate local handlers."),
+            ("app_demo_023", "need_demo_009", "vol_demo_009", "accepted", "Can manage registration desk."),
+            ("app_demo_024", "need_demo_009", "vol_demo_004", "pinned",   "Can join after hospital shift."),
+            ("app_demo_025", "need_demo_010", "vol_demo_001", "accepted", "Available for patient transport."),
+            ("app_demo_026", "need_demo_010", "vol_demo_007", "accepted", "Driver with night-shift availability."),
         ]
         for app_id, need_id, vol_id, decision, note in extra_apps:
             existing = _execute(
@@ -2009,4 +2135,106 @@ def _seed_extra_demo_volunteers() -> None:
             if existing is None:
                 _execute(cursor, app_sql, (app_id, need_id, vol_id, decision, note, now, now))
 
+        field_reports = [
+            (
+                "fr_demo_001",
+                "vol_demo_001",
+                "Floodwater entered 2 lanes near Yamuna bank. Families requesting dry rations and clean water.",
+                "high",
+                _to_json(["flood-response", "food-distribution"]),
+                _to_json(["water", "dry ration", "blankets"]),
+                86,
+                18,
+                28.6324,
+                77.2450,
+                "Yamuna Bank Cluster, Delhi",
+                "Voice note from volunteer on site.",
+                "Waterlogged street and stranded families",
+                now,
+            ),
+            (
+                "fr_demo_002",
+                "vol_demo_008",
+                "Temporary camp has increasing fever cases. Need doctor triage desk and medicine stock check.",
+                "critical",
+                _to_json(["medical-camp", "sanitation"]),
+                _to_json(["antibiotics", "oral rehydration salts", "first aid"]),
+                54,
+                12,
+                28.6650,
+                77.3502,
+                "Relief Camp B, Ghaziabad",
+                "Audio + image input from clinic tent.",
+                "Crowded camp clinic queue",
+                now,
+            ),
+            (
+                "fr_demo_003",
+                "vol_demo_010",
+                "Community requested child-safe shelter corner and women support desk for night shift.",
+                "medium",
+                _to_json(["shelter", "community-support"]),
+                _to_json(["hygiene kits", "mats"]),
+                37,
+                8,
+                28.5710,
+                77.3662,
+                "Noida Extension Shelter Point",
+                "Gesture translator assisted message.",
+                "Inside shelter registration area",
+                now,
+            ),
+        ]
+        for report in field_reports:
+            exists = _execute(cursor, "SELECT id FROM field_reports WHERE id = ?", (report[0],)).fetchone()
+            if exists is None:
+                _execute(
+                    cursor,
+                    """
+                    INSERT INTO field_reports (
+                        id, volunteer_id, summary, severity, categories_json, supply_needs_json,
+                        people_count_estimate, required_volunteers_estimate, location_lat, location_lng,
+                        address, raw_audio_text, image_hint, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    report,
+                )
+
         connection.commit()
+
+def create_session(user_id: str) -> str:
+    session_id = f"sess_{uuid4().hex}"
+    token = uuid4().hex + uuid4().hex
+    
+    # 24 hours expiry
+    from datetime import datetime, timedelta
+    expires_at = (datetime.utcnow() + timedelta(hours=24)).isoformat()
+    
+    with get_connection() as connection:
+        cursor = connection.cursor()
+        _execute(
+            cursor,
+            "INSERT INTO sessions (id, user_id, token, expires_at) VALUES (?, ?, ?, ?)",
+            (session_id, user_id, token, expires_at),
+        )
+        connection.commit()
+    return token
+
+def get_session(token: str) -> dict | None:
+    from datetime import datetime
+    with get_connection() as connection:
+        cursor = connection.cursor()
+        row = _execute(
+            cursor,
+            "SELECT user_id, expires_at FROM sessions WHERE token = ?",
+            (token,),
+        ).fetchone()
+        
+        if not row:
+            return None
+            
+        expires_at = _row_get(row, "expires_at")
+        if expires_at < datetime.utcnow().isoformat():
+            return None
+            
+        return {"user_id": _row_get(row, "user_id")}

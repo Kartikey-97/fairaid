@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from "react";
 
-import { runAllocation } from "@/lib/api";
+import { runAllocation, fetchAllocationData } from "@/lib/api";
 import type { AllocationRequest, AllocationResponse, AllocationState } from "@/lib/types";
 
 const SAMPLE_REQUEST: AllocationRequest = {
@@ -120,6 +120,7 @@ export default function AllocationPage() {
   const [requestJson, setRequestJson] = useState<string>(
     JSON.stringify(SAMPLE_REQUEST, null, 2),
   );
+  const [isSandboxMode, setIsSandboxMode] = useState(true);
   const [result, setResult] = useState<AllocationResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -137,6 +138,23 @@ export default function AllocationPage() {
   const handleResetSample = () => {
     setRequestJson(JSON.stringify(SAMPLE_REQUEST, null, 2));
     setError(null);
+    setIsSandboxMode(true);
+  };
+
+  const handleLoadLive = async () => {
+    setError(null);
+    setIsLoading(true);
+    try {
+      const data = await fetchAllocationData();
+      setRequestJson(JSON.stringify(data, null, 2));
+      setIsSandboxMode(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load live DB data.");
+      setRequestJson(JSON.stringify(SAMPLE_REQUEST, null, 2));
+      setIsSandboxMode(true);
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   const handleRunAllocation = async () => {
@@ -170,7 +188,14 @@ export default function AllocationPage() {
   return (
     <main className="mx-auto flex w-full max-w-6xl flex-1 flex-col gap-6 px-4 py-8 sm:px-6 lg:px-8">
       <header className="space-y-2">
-        <h1 className="text-2xl font-bold text-zinc-900">FairAid Allocation Runner</h1>
+        <div className="flex flex-wrap items-center gap-2">
+          <h1 className="text-2xl font-bold text-zinc-900">FairAid Allocation Runner</h1>
+          {isSandboxMode ? (
+            <span className="inline-flex items-center rounded-full border border-amber-300 bg-amber-50 px-2.5 py-1 text-xs font-semibold text-amber-800">
+              Sandbox Mode
+            </span>
+          ) : null}
+        </div>
         <p className="text-sm text-zinc-600">
           Submit volunteers and needs, run the allocator, and compare outcomes for each lambda value.
         </p>
@@ -192,6 +217,13 @@ export default function AllocationPage() {
             className="rounded-md border border-zinc-300 px-4 py-2 text-sm font-medium text-zinc-800 transition hover:bg-zinc-50"
           >
             Reset Sample Input
+          </button>
+          <button
+            type="button"
+            onClick={handleLoadLive}
+            className="rounded-md border border-zinc-300 px-4 py-2 text-sm font-medium text-blue-600 transition hover:bg-blue-50"
+          >
+            Load Live DB Data
           </button>
         </div>
 

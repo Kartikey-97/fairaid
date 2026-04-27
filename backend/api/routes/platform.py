@@ -1,5 +1,6 @@
 import json
 import math
+import os
 import time
 from datetime import datetime, timezone
 import re
@@ -7,7 +8,7 @@ from urllib.error import URLError
 from urllib.parse import quote_plus
 from urllib.request import Request, urlopen
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, Response, Request, Depends, Cookie
 
 from backend.api.schemas.need import (
     NeedAuditEntry,
@@ -704,8 +705,40 @@ def _dispatch_emergency_notifications(need: dict, volunteer_ids: list[str]) -> N
         )
 
 
+def require_session(session_id: str | None = Cookie(None)):
+    if not session_id:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    session_data = storage.get_session(session_id)
+    if not session_data:
+        raise HTTPException(status_code=401, detail="Session expired or invalid")
+    return session_data["user_id"]
+
+
+def _session_cookie_options() -> dict:
+    max_age_raw = os.getenv("FAIRAID_SESSION_MAX_AGE_SECONDS", "86400")
+    try:
+        max_age = int(max_age_raw)
+    except ValueError:
+        max_age = 86400
+
+    samesite = os.getenv("FAIRAID_COOKIE_SAMESITE", "lax").strip().lower()
+    if samesite not in {"lax", "strict", "none"}:
+        samesite = "lax"
+
+    secure_raw = os.getenv("FAIRAID_COOKIE_SECURE", "false").strip().lower()
+    secure = secure_raw in {"1", "true", "yes", "on"}
+    if samesite == "none":
+        secure = True
+
+    return {
+        "httponly": True,
+        "max_age": max_age,
+        "samesite": samesite,
+        "secure": secure,
+    }
+
 @router.post("/auth/signup", response_model=AuthSessionResponse)
-def signup(payload: AuthSignupRequest) -> AuthSessionResponse:
+def signup(payload: AuthSignupRequest, response: Response) -> AuthSessionResponse:
     try:
         user = storage.create_user(
             name=payload.name,
@@ -715,6 +748,9 @@ def signup(payload: AuthSignupRequest) -> AuthSessionResponse:
         )
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+
+    session_token = storage.create_session(user["id"])
+    response.set_cookie(key="session_id", value=session_token, **_session_cookie_options())
 
     return AuthSessionResponse(
         user_id=user["id"],
@@ -727,12 +763,15 @@ def signup(payload: AuthSignupRequest) -> AuthSessionResponse:
 
 
 @router.post("/auth/login", response_model=AuthSessionResponse)
-def login(payload: AuthLoginRequest) -> AuthSessionResponse:
+def login(payload: AuthLoginRequest, response: Response) -> AuthSessionResponse:
     user = storage.authenticate_user(payload.email, payload.password, payload.role)
     if user is None:
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     volunteer_profile = storage.get_volunteer_by_user(user["id"])
+
+    session_token = storage.create_session(user["id"])
+    response.set_cookie(key="session_id", value=session_token, **_session_cookie_options())
 
     return AuthSessionResponse(
         user_id=user["id"],
@@ -855,6 +894,35 @@ def list_needs(
         NeedRecord(**item)
         for item in storage.list_needs(status=status, emergency_only=emergency_only)
     ]
+
+
+@router.get("/needs/active")
+def list_active_needs_for_map() -> list[dict]:
+    """
+    Lightweight map-focused view of active needs.
+    """
+    active_needs = storage.list_needs(status="open")
+    payload: list[dict] = []
+    for need in active_needs:
+        location = need.get("location")
+        if not location:
+            continue
+        payload.append(
+            {
+                "id": need.get("id"),
+                "title": need.get("title"),
+                "ngo_name": need.get("ngo_name"),
+                "need_type": need.get("need_type"),
+                "emergency_level": need.get("emergency_level"),
+                "urgency": int(need.get("urgency", 0)),
+                "required_volunteers": int(need.get("required_volunteers", 0)),
+                "accepted_count": int(need.get("accepted_count", 0)),
+                "address": need.get("address"),
+                "location": location,
+                "status": need.get("status", "open"),
+            }
+        )
+    return payload
 
 
 @router.get("/catalog")
@@ -1065,9 +1133,7 @@ def get_volunteer_feed(
         if payload.include_non_emergency
         else emergency_cards
     )
-    
-    # Hackathon Fix: Always show all tasks in the feed regardless of strict API flags
-    all_cards = cards[: payload.limit]
+
 
     return VolunteerFeedResponse(
         volunteer_id=volunteer_id,
@@ -1076,7 +1142,9 @@ def get_volunteer_feed(
         all=all_cards,
     )
 
-#ADDED by gemini 
+def cluster_by_grid(lat: float, lng: float) -> tuple[float, float]:
+    return round(lat, 1), round(lng, 1)
+
 @router.get("/insights/hotspots")
 def get_hotspots() -> dict:
     """
@@ -1087,6 +1155,8 @@ def get_hotspots() -> dict:
     category_counts: dict[str, dict] = {}
     total_needed = 0
     total_assigned = 0
+    
+    clusters = {}
 
     for need in open_needs:
         cat = str(need.get("need_type", "unknown"))
@@ -1101,6 +1171,19 @@ def get_hotspots() -> dict:
         category_counts[cat]["accepted_volunteers"] += acc
         total_needed += req
         total_assigned += acc
+
+        # Geo-clustering
+        if need.get("location"):
+            lat = need["location"].get("lat")
+            lng = need["location"].get("lng")
+            if lat is not None and lng is not None:
+                grid = cluster_by_grid(float(lat), float(lng))
+                grid_key = f"{grid[0]},{grid[1]}"
+                if grid_key not in clusters:
+                    clusters[grid_key] = {"lat": grid[0], "lng": grid[1], "count": 0, "emergency_count": 0}
+                clusters[grid_key]["count"] += 1
+                if need.get("emergency_level") == "emergency":
+                    clusters[grid_key]["emergency_count"] += 1
 
     # Include multimodal field intelligence signals so urgent zones appear quickly
     # even before NGO operators complete manual request entries.
@@ -1117,6 +1200,18 @@ def get_hotspots() -> dict:
             category_counts[cat]["required_volunteers"] += report_required
             total_needed += report_required
 
+        if report.get("location"):
+            lat = report["location"].get("lat")
+            lng = report["location"].get("lng")
+            if lat is not None and lng is not None:
+                grid = cluster_by_grid(float(lat), float(lng))
+                grid_key = f"{grid[0]},{grid[1]}"
+                if grid_key not in clusters:
+                    clusters[grid_key] = {"lat": grid[0], "lng": grid[1], "count": 0, "emergency_count": 0}
+                clusters[grid_key]["count"] += 1
+                if str(report.get("severity", "")).lower() in ["high", "critical"]:
+                    clusters[grid_key]["emergency_count"] += 1
+
     urgent_categories = sorted(
         [{"category": k, **v} for k, v in category_counts.items()],
         key=lambda x: int(x["required_volunteers"]) - int(x["accepted_volunteers"]),
@@ -1128,6 +1223,7 @@ def get_hotspots() -> dict:
         "total_volunteers_needed": total_needed,
         "total_volunteers_assigned": total_assigned,
         "urgent_categories": urgent_categories,
+        "clusters": list(clusters.values()),
     }
 
 
@@ -1190,6 +1286,18 @@ async def create_field_intel_report(
 def list_field_intel_reports(limit: int = Query(default=25, ge=1, le=100)) -> dict:
     reports = storage.list_field_reports(limit=limit)
     return {"reports": reports}
+
+
+@router.delete("/field-intel/reports/{report_id}")
+def delete_field_intel_report(report_id: str, ngo_id: str = Query(...)) -> dict:
+    user = storage.get_user(ngo_id)
+    if user is None or user.get("role") != "ngo":
+        raise HTTPException(status_code=403, detail="Only NGO accounts can delete ground updates.")
+
+    removed = storage.delete_field_report(report_id)
+    if not removed:
+        raise HTTPException(status_code=404, detail="Ground update not found.")
+    return {"status": "deleted", "report_id": report_id}
 
 
 @router.post("/ngo/{ngo_id}/needs/{need_id}/autonomous-dispatch")

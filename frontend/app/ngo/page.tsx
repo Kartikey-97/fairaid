@@ -1,9 +1,11 @@
 "use client";
 
+import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   createNeed,
+  deleteFieldIntelReport,
   deleteNgoNeed,
   draftNeedFromText,
   fetchCatalog,
@@ -88,6 +90,9 @@ function LocalTime({ value }: { value: string }) {
 
 export default function NgoPage() {
   const { session, isChecking, isAuthorized } = useAuthGuard("ngo");
+  const sessionUserId = session?.user_id ?? "";
+  const sessionName = session?.name ?? "";
+  const sessionEmail = session?.email ?? "";
 
   const [catalog, setCatalog] = useState<SkillCatalog>(DEFAULT_CATALOG);
   const [templates, setTemplates] = useState<NeedTemplate[]>([]);
@@ -102,6 +107,7 @@ export default function NgoPage() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isLocating, setIsLocating] = useState(false);
   const [addressSuggestions, setAddressSuggestions] = useState<Array<{ lat: number; lng: number; display_name: string }>>([]);
+  const [isAddressMenuOpen, setIsAddressMenuOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [offlineMode, setOfflineMode] = useState(false);
   const [lastSyncAt, setLastSyncAt] = useState<string | null>(null);
@@ -150,11 +156,11 @@ export default function NgoPage() {
     };
   }
 
-  const ngoNeedsCacheKey = session ? `fairaid_cache_ngo_needs_${session.user_id}` : "fairaid_cache_ngo_needs";
+  const ngoNeedsCacheKey = sessionUserId ? `fairaid_cache_ngo_needs_${sessionUserId}` : "fairaid_cache_ngo_needs";
   const ngoHotspotCacheKey = "fairaid_cache_hotspots";
   const ngoCatalogCacheKey = "fairaid_cache_catalog";
   const ngoTemplateCacheKey = "fairaid_cache_templates";
-  const ngoQueueKey = session ? `fairaid_queue_ngo_needs_${session.user_id}` : "fairaid_queue_ngo_needs";
+  const ngoQueueKey = sessionUserId ? `fairaid_queue_ngo_needs_${sessionUserId}` : "fairaid_queue_ngo_needs";
 
   const syncQueuedNeeds = useCallback(async (ngoId: string) => {
     const queue = readQueue<QueuedNeed>(ngoQueueKey);
@@ -193,7 +199,7 @@ export default function NgoPage() {
   }, [ngoHotspotCacheKey, ngoNeedsCacheKey, ngoQueueKey]);
 
   useEffect(() => {
-    if (!session || !isAuthorized) {
+    if (!sessionUserId || !isAuthorized) {
       return;
     }
 
@@ -202,7 +208,7 @@ export default function NgoPage() {
         const [library, templateData, ngoNeeds, hotspotsData, reports] = await Promise.all([
           fetchCatalog(),
           fetchNeedTemplates(),
-          fetchNgoNeeds(session.user_id),
+          fetchNgoNeeds(sessionUserId),
           fetchHotspots().catch(() => null),
           fetchFieldIntelReports(20).catch(() => []),
         ]);
@@ -211,7 +217,7 @@ export default function NgoPage() {
         setNeeds(ngoNeeds);
         setHotspots(hotspotsData);
         setFieldReports(reports);
-        setForm(buildDefaultNeed(session.name, session.email, session.user_id, library));
+        setForm(buildDefaultNeed(sessionName, sessionEmail, sessionUserId, library));
 
         writeCached(ngoCatalogCacheKey, library);
         writeCached(ngoTemplateCacheKey, templateData);
@@ -222,7 +228,7 @@ export default function NgoPage() {
         setOfflineMode(false);
         setLastSyncAt(new Date().toISOString());
         setError(null);
-        await syncQueuedNeeds(session.user_id);
+        await syncQueuedNeeds(sessionUserId);
       } catch (loadError) {
         const cachedCatalog = readCached<SkillCatalog>(ngoCatalogCacheKey)?.data ?? DEFAULT_CATALOG;
         const cachedTemplates = readCached<NeedTemplate[]>(ngoTemplateCacheKey)?.data ?? [];
@@ -233,7 +239,7 @@ export default function NgoPage() {
         setNeeds(cachedNeeds);
         setHotspots(cachedHotspots);
         setFieldReports([]);
-        setForm(buildDefaultNeed(session.name, session.email, session.user_id, cachedCatalog));
+        setForm(buildDefaultNeed(sessionName, sessionEmail, sessionUserId, cachedCatalog));
         setOfflineMode(true);
         setLastSyncAt(readCached<NeedRecord[]>(ngoNeedsCacheKey)?.updated_at ?? null);
         const message =
@@ -245,14 +251,16 @@ export default function NgoPage() {
     void loadNgoWorkspace();
 
     const onlineHandler = () => {
-      void syncQueuedNeeds(session.user_id);
+      void syncQueuedNeeds(sessionUserId);
       void loadNgoWorkspace();
     };
     window.addEventListener("online", onlineHandler);
     return () => window.removeEventListener("online", onlineHandler);
   }, [
     isAuthorized,
-    session,
+    sessionUserId,
+    sessionName,
+    sessionEmail,
     ngoCatalogCacheKey,
     ngoHotspotCacheKey,
     ngoNeedsCacheKey,
@@ -261,6 +269,10 @@ export default function NgoPage() {
   ]);
 
   useEffect(() => {
+    if (!isAddressMenuOpen) {
+      setAddressSuggestions([]);
+      return;
+    }
     const query = (form?.address ?? "").trim();
     if (query.length < 3) {
       setAddressSuggestions([]);
@@ -272,7 +284,7 @@ export default function NgoPage() {
         .catch(() => setAddressSuggestions([]));
     }, 250);
     return () => clearTimeout(timer);
-  }, [form?.address]);
+  }, [form?.address, isAddressMenuOpen]);
 
   function applyAddressInput(value: string) {
     const normalized = value.trim().toLowerCase();
@@ -301,6 +313,7 @@ export default function NgoPage() {
         : prev,
     );
     setAddressSuggestions([]);
+    setIsAddressMenuOpen(false);
   }
 
   const stats = useMemo(() => {
@@ -498,8 +511,8 @@ export default function NgoPage() {
       }
       setOfflineMode(false);
       setLastSyncAt(new Date().toISOString());
-      if (session) {
-        setForm(buildDefaultNeed(session.name, session.email, session.user_id, catalog));
+      if (sessionUserId) {
+        setForm(buildDefaultNeed(sessionName, sessionEmail, sessionUserId, catalog));
       }
     } catch (createError) {
       const queued: QueuedNeed = {
@@ -531,13 +544,13 @@ export default function NgoPage() {
   }
 
   async function handleDeleteNeed(needId: string) {
-    if (!session) {
+    if (!sessionUserId) {
       return;
     }
     setError(null);
     try {
-      await deleteNgoNeed(session.user_id, needId);
-      const refreshed = await fetchNgoNeeds(session.user_id);
+      await deleteNgoNeed(sessionUserId, needId);
+      const refreshed = await fetchNgoNeeds(sessionUserId);
       setNeeds(refreshed);
       writeCached(ngoNeedsCacheKey, refreshed);
       const latestHotspots = await fetchHotspots().catch(() => null);
@@ -565,15 +578,15 @@ export default function NgoPage() {
   }
 
   async function handleAutoDispatch(needId: string) {
-    if (!session) {
+    if (!sessionUserId) {
       return;
     }
     setError(null);
     setDispatchLoadingId(needId);
     try {
-      const response = await runAutonomousDispatch(session.user_id, needId);
+      const response = await runAutonomousDispatch(sessionUserId, needId);
       setDispatchByNeed((prev) => ({ ...prev, [needId]: response }));
-      const refreshedNeeds = await fetchNgoNeeds(session.user_id).catch(() => null);
+      const refreshedNeeds = await fetchNgoNeeds(sessionUserId).catch(() => null);
       if (refreshedNeeds) {
         setNeeds(refreshedNeeds);
         writeCached(ngoNeedsCacheKey, refreshedNeeds);
@@ -609,6 +622,12 @@ export default function NgoPage() {
         location: report.location ?? prev.location,
       };
     });
+    const formElement = document.getElementById("create-request");
+    if (formElement) {
+      formElement.scrollIntoView({ behavior: "smooth" });
+    } else {
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    }
   }
 
   if (isChecking || !form) {
@@ -638,8 +657,13 @@ export default function NgoPage() {
       <Card>
         <h1 className="text-3xl text-[var(--text-strong)]">NGO Workspace</h1>
         <p className="mt-2 text-sm text-[var(--text-muted)]">
-          Welcome, {session?.name}. Use templates, AI drafting, and map-assisted location to post high-quality volunteer requests.
+          Welcome, {sessionName}. Use templates, AI drafting, and map-assisted location to post high-quality volunteer requests.
         </p>
+        <div className="mt-3">
+          <Link href="/surveys/upload">
+            <Button variant="secondary">Upload Survey CSV</Button>
+          </Link>
+        </div>
       </Card>
 
       <section className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
@@ -754,9 +778,23 @@ export default function NgoPage() {
                   ))}
                 </div>
                 <div className="mt-3">
-                  <Button variant="ghost" onClick={() => applyFieldReportToDraft(report)}>
-                    Use in Request Draft
-                  </Button>
+                  <div className="flex flex-wrap gap-2">
+                    <Button variant="ghost" onClick={() => applyFieldReportToDraft(report)}>
+                      Use in Request Draft
+                    </Button>
+                    <Button
+                      variant="danger"
+                      onClick={() => {
+                        deleteFieldIntelReport(report.id, sessionUserId)
+                          .then(() => setFieldReports((prev) => prev.filter((item) => item.id !== report.id)))
+                          .catch((deleteError) =>
+                            setError(deleteError instanceof Error ? deleteError.message : "Could not delete update."),
+                          );
+                      }}
+                    >
+                      Delete Update
+                    </Button>
+                  </div>
                 </div>
               </div>
             ))
@@ -920,7 +958,14 @@ export default function NgoPage() {
                 <div className="relative">
                   <input
                     value={form.address ?? ""}
-                    onChange={(event) => applyAddressInput(event.target.value)}
+                    onFocus={() => setIsAddressMenuOpen(true)}
+                    onBlur={() => {
+                      window.setTimeout(() => setIsAddressMenuOpen(false), 120);
+                    }}
+                    onChange={(event) => {
+                      applyAddressInput(event.target.value);
+                      setIsAddressMenuOpen(true);
+                    }}
                     className="w-full rounded-xl border border-[var(--border)] bg-[var(--surface-elevated)] px-3 py-2"
                     placeholder="Start typing area/city/street..."
                     list="ngo-address-suggestions"
@@ -930,7 +975,7 @@ export default function NgoPage() {
                       <option key={`${item.lat}-${item.lng}`} value={item.display_name} />
                     ))}
                   </datalist>
-                  {addressSuggestions.length > 0 ? (
+                  {isAddressMenuOpen && addressSuggestions.length > 0 ? (
                     <div className="absolute left-0 right-0 top-[calc(100%+6px)] z-20 max-h-48 overflow-auto rounded-xl border border-[var(--border)] bg-[var(--surface)] shadow-[0_14px_34px_rgba(9,26,41,0.12)]">
                       {addressSuggestions.slice(0, 5).map((item) => (
                         <button
@@ -1106,7 +1151,7 @@ export default function NgoPage() {
                             setExpandedRosterId(need.id);
                             if (!rosterByNeed[need.id]) {
                               setRosterLoadingId(need.id);
-                              fetchNeedVolunteers(session!.user_id, need.id)
+                              fetchNeedVolunteers(sessionUserId, need.id)
                                 .then((res) => setRosterByNeed((prev) => ({ ...prev, [need.id]: res.applications })))
                                 .catch(() => setRosterByNeed((prev) => ({ ...prev, [need.id]: [] })))
                                 .finally(() => setRosterLoadingId(null));
@@ -1179,7 +1224,7 @@ export default function NgoPage() {
                                     className="shrink-0 rounded-lg border px-2 py-1 text-[10px] font-medium transition hover:opacity-80"
                                     style={{ borderColor: "var(--accent)", color: "var(--accent)", background: "var(--accent-soft)" }}
                                     onClick={() => {
-                                      removeVolunteerFromNeed(session!.user_id, need.id, app.volunteer_id)
+                                      removeVolunteerFromNeed(sessionUserId, need.id, app.volunteer_id)
                                         .then(() => {
                                           setRosterByNeed((prev) => ({
                                             ...prev,

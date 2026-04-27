@@ -52,7 +52,10 @@ async function fetchJson<T>(
   path: string,
   options?: RequestInit,
 ): Promise<T> {
-  const response = await fetch(`${API_BASE_URL}${path}`, options);
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    credentials: "include",
+    ...options,
+  });
   if (!response.ok) {
     const raw = await response.text();
     let message = raw || `Request failed with status ${response.status}`;
@@ -81,8 +84,12 @@ export async function runAllocation(
   });
 }
 
+export async function fetchAllocationData(): Promise<AllocationRequest> {
+  return fetchJson<AllocationRequest>("/allocation-data");
+}
+
 export async function registerVolunteer(
-  payload: VolunteerRegisterRequest,
+  payload: VolunteerRegisterRequest
 ): Promise<VolunteerProfile> {
   return fetchJson<VolunteerProfile>("/platform/volunteers/register", {
     method: "POST",
@@ -144,6 +151,22 @@ export async function fetchNeeds(params?: {
   const query = searchParams.toString();
   const path = query ? `/platform/needs?${query}` : "/platform/needs";
   return fetchJson<NeedRecord[]>(path);
+}
+
+export async function fetchActiveNeeds(): Promise<Array<{
+  id: string;
+  title: string;
+  ngo_name: string;
+  need_type: string;
+  emergency_level: string;
+  urgency: number;
+  required_volunteers: number;
+  accepted_count: number;
+  address?: string | null;
+  location: { lat: number; lng: number };
+  status: string;
+}>> {
+  return fetchJson("/platform/needs/active");
 }
 
 export async function fetchCatalog(): Promise<SkillCatalog> {
@@ -308,6 +331,12 @@ export async function fetchFieldIntelReports(limit = 25): Promise<FieldIntelRepo
   return response.reports;
 }
 
+export async function deleteFieldIntelReport(reportId: string, ngoId: string): Promise<{ status: string; report_id: string }> {
+  return fetchJson<{ status: string; report_id: string }>(`/platform/field-intel/reports/${reportId}?ngo_id=${encodeURIComponent(ngoId)}`, {
+    method: "DELETE",
+  });
+}
+
 export async function runAutonomousDispatch(
   ngoId: string,
   needId: string,
@@ -316,4 +345,13 @@ export async function runAutonomousDispatch(
     `/platform/ngo/${ngoId}/needs/${needId}/autonomous-dispatch`,
     { method: "POST" },
   );
+}
+
+export async function uploadSurveyCsv(file: File): Promise<{ status: string; processed_count: number }> {
+  const formData = new FormData();
+  formData.append("file", file);
+  return fetchJson<{ status: string; processed_count: number }>("/api/surveys/upload", {
+    method: "POST",
+    body: formData,
+  });
 }

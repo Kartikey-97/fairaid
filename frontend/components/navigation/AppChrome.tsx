@@ -3,22 +3,23 @@
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { ReactNode, useEffect, useMemo, useState, useSyncExternalStore } from "react";
-import { clearSession, getSession, getStoredTheme, setStoredTheme } from "@/lib/session";
+import { clearSession, getSession, getStoredTheme, setStoredTheme, subscribeSessionStore } from "@/lib/session";
 
 type AppChromeProps = {
   children: ReactNode;
 };
 
+const emptySubscribe = () => () => {};
+const getTrue = () => true;
+const getFalse = () => false;
+const getNull = () => null;
+
 export function AppChrome({ children }: AppChromeProps) {
   const pathname = usePathname();
   const router = useRouter();
 
-  const hydrated = useSyncExternalStore(
-    () => () => {},
-    () => true,
-    () => false,
-  );
-  const session = hydrated ? getSession() : null;
+  const session = useSyncExternalStore(subscribeSessionStore, getSession, getNull);
+  const hydrated = useSyncExternalStore(emptySubscribe, getTrue, getFalse);
 
   const [theme, setTheme] = useState<"light" | "dark">(() => getStoredTheme());
 

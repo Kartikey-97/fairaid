@@ -5,6 +5,7 @@ type TimelineItem = {
   end: string;
   lane?: string;
   color?: string;
+  status?: string | null;
 };
 
 type TimelineProps = {
@@ -64,6 +65,7 @@ export function Timeline({ title, items }: TimelineProps) {
                     left: `${left}%`,
                     width: `${width}%`,
                     background: item.color ?? "var(--brand)",
+                    opacity: item.status === "interested" ? 0.3 : 1,
                   }}
                 />
               </div>

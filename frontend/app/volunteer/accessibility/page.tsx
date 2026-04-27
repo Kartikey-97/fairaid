@@ -36,6 +36,8 @@ export default function AccessibilityPage() {
   const rafRef = useRef<number | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const lastEmissionRef = useRef<{ label: string; at: number }>({ label: "", at: 0 });
+  const lastVideoTimeRef = useRef<number>(-1);
+  const lastWarningRef = useRef<{ message: string; at: number }>({ message: "", at: 0 });
 
   const [isStarting, setIsStarting] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
@@ -100,6 +102,7 @@ export default function AccessibilityPage() {
       streamRef.current.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
     }
+    lastVideoTimeRef.current = -1;
     setIsRunning(false);
     setStatus("Stopped");
   }
@@ -107,14 +110,12 @@ export default function AccessibilityPage() {
   async function startCamera() {
     try {
       setIsStarting(true);
-    // Ensure camera facing mode is respected on start
-    // No additional code needed here
       setStatus("Loading offline model...");
       const recognizer = await ensureRecognizer();
 
       const stream = await navigator.mediaDevices.getUserMedia({
-          video: { width: 960, height: 540, facingMode: cameraFacingMode },
-        });
+        video: { width: 960, height: 540, facingMode: cameraFacingMode },
+      });
       streamRef.current = stream;
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
@@ -131,26 +132,53 @@ export default function AccessibilityPage() {
           return;
         }
 
-        if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
-          const result = recognizer.recognizeForVideo(video, performance.now());
-          const top = result.gestures?.[0]?.[0];
-          const category = top?.categoryName ?? "";
+        const hasNewFrame = video.currentTime > lastVideoTimeRef.current;
+        if (
+          video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
+          video.currentTime > 0 &&
+          hasNewFrame
+        ) {
+          try {
+            lastVideoTimeRef.current = video.currentTime;
+            const result = recognizer.recognizeForVideo(video, performance.now());
+            const top = result.gestures?.[0]?.[0];
+            const category = top?.categoryName ?? "";
 
-          if (category) {
-            setGesture(category);
-            const mapped = GESTURE_MAP[category] ?? "UNMAPPED GESTURE";
-            setTranslated(mapped);
-            if (mapped !== "UNMAPPED GESTURE") {
+            if (category) {
+              setGesture(category);
+              const mapped = GESTURE_MAP[category] ?? "UNMAPPED GESTURE";
+              setTranslated(mapped);
+              if (mapped !== "UNMAPPED GESTURE") {
+                const now = Date.now();
+                if (
+                  mapped !== lastEmissionRef.current.label
+                  || now - lastEmissionRef.current.at > 1800
+                ) {
+                  lastEmissionRef.current = { label: mapped, at: now };
+                  setHistory((prev) => {
+                    const next = [`${new Date().toLocaleTimeString()} · ${mapped}`, ...prev];
+                    return next.slice(0, 8);
+                  });
+                }
+              }
+            }
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            // Ignore non-fatal MediaPipe/TFLite startup warnings in browser console.
+            if (
+              message.includes("XNNPACK delegate")
+              || message.includes("Wait until the video")
+              || message.includes("No hands detected")
+            ) {
+              // no-op
+            } else {
               const now = Date.now();
               if (
-                mapped !== lastEmissionRef.current.label
-                || now - lastEmissionRef.current.at > 1800
+                message !== lastWarningRef.current.message
+                || now - lastWarningRef.current.at > 2500
               ) {
-                lastEmissionRef.current = { label: mapped, at: now };
-                setHistory((prev) => {
-                  const next = [`${new Date().toLocaleTimeString()} · ${mapped}`, ...prev];
-                  return next.slice(0, 8);
-                });
+                lastWarningRef.current = { message, at: now };
+                setStatus(`Recognizer warning: ${message}`);
               }
             }
           }
@@ -207,6 +235,19 @@ export default function AccessibilityPage() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!isRunning) {
+      return;
+    }
+    const restartCamera = async () => {
+      stopCamera();
+      await startCamera();
+    };
+    void restartCamera();
+    // Restart stream when user taps preview to flip camera.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cameraFacingMode]);
+
   if (isChecking) {
     return (
       <main className="mx-auto w-full max-w-6xl px-4 py-8 sm:px-6 lg:px-8">
@@ -226,8 +267,23 @@ export default function AccessibilityPage() {
 
       <section className="grid gap-6 lg:grid-cols-[1.25fr_1fr]">
         <Card>
-          <div className="overflow-hidden rounded-2xl border border-[var(--border)] bg-black/70">
-            <video ref={videoRef} className="h-[360px] w-full object-cover" muted playsInline />
+          <div className="relative overflow-hidden rounded-2xl border border-[var(--border)] bg-black/70">
+            <video 
+              ref={videoRef} 
+              className="h-[360px] w-full object-cover cursor-pointer" 
+              muted 
+              playsInline 
+              onClick={() => setCameraFacingMode(prev => prev === "environment" ? "user" : "environment")}
+            />
+            {isRunning && (
+              <div className="pointer-events-none absolute bottom-4 right-4 rounded-full bg-black/50 p-2 text-white backdrop-blur-sm">
+                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M17 2.1l4 4-4 4"/>
+                  <path d="M3 12.2v-2a4 4 0 0 1 4-4h12.8M7 21.9l-4-4 4-4"/>
+                  <path d="M21 11.8v2a4 4 0 0 1-4 4H4.2"/>
+                </svg>
+              </div>
+            )}
           </div>
           <div className="mt-3 flex flex-wrap gap-2">
             {/* Camera control buttons */}
@@ -238,10 +294,6 @@ export default function AccessibilityPage() {
               {isStarting ? "Starting..." : "Start Translator"}
             </Button>
           )}
-          {/* Flip Camera button */}
-          <Button variant="secondary" onClick={() => setCameraFacingMode(prev => prev === "environment" ? "user" : "environment")} disabled={isStarting}>
-            Flip Camera
-          </Button>
           {/* Send Signal button */}
           <Button variant="secondary" onClick={sendSignalToNgo} disabled={isSending || !volunteer}>
             {isSending ? "Sending..." : "Send Signal to NGO"}

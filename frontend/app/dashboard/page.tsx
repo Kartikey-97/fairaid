@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { fetchHotspots, fetchNeeds } from "@/lib/api";
 import type { HotspotsResponse, NeedRecord } from "@/lib/types";
@@ -39,7 +39,7 @@ export default function DashboardPage() {
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
   const [isLoading, setIsLoading] = useState(false);
 
-  const loadData = async () => {
+  const loadData = useCallback(async () => {
     setIsLoading(true);
     try {
       const [needsData, hotspotsData] = await Promise.all([
@@ -54,7 +54,7 @@ export default function DashboardPage() {
     } finally {
       setIsLoading(false);
     }
-  };
+  }, []);
 
   useEffect(() => {
     void loadData();
@@ -66,8 +66,7 @@ export default function DashboardPage() {
       }
     }, 5 * 60 * 1000);
     return () => clearInterval(interval);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [loadData]);
 
   const stats = useMemo(() => {
     const emergency = needs.filter((n) => n.emergency_level === "emergency").length;

@@ -1,6 +1,6 @@
 "use client";
 
-import { ChangeEvent, useEffect, useMemo, useState } from "react";
+import { ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   fetchCatalog,
@@ -12,6 +12,7 @@ import {
 } from "@/lib/api";
 import { DEFAULT_CATALOG } from "@/lib/catalog";
 import { geocodeAddress, reverseGeocode } from "@/lib/location";
+import { setSession } from "@/lib/session";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 import type { SkillCatalog, VolunteerRegisterRequest } from "@/lib/types";
 import dynamic from "next/dynamic";
@@ -47,6 +48,10 @@ function normalizeRegisterPayload(form: VolunteerRegisterRequest): VolunteerRegi
 
 export default function VolunteerProfilePage() {
   const { session, isChecking, isAuthorized } = useAuthGuard("volunteer");
+  const sessionUserId = session?.user_id ?? "";
+  const sessionName = session?.name ?? "";
+  const sessionEmail = session?.email ?? "";
+  const sessionVolunteerId = session?.volunteer_id ?? null;
 
   const [catalog, setCatalog] = useState<SkillCatalog>(DEFAULT_CATALOG);
   const [form, setForm] = useState<VolunteerRegisterRequest | null>(null);
@@ -56,32 +61,36 @@ export default function VolunteerProfilePage() {
   const [notifications, setNotifications] = useState<Array<{ id: string; title: string; message: string }>>([]);
   const [jobQuery, setJobQuery] = useState("");
   const [skillQuery, setSkillQuery] = useState("");
+  const [isJobMenuOpen, setIsJobMenuOpen] = useState(false);
+  const [isAddressMenuOpen, setIsAddressMenuOpen] = useState(false);
+  const [selectedImageName, setSelectedImageName] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
+  const imageInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
-    if (!session || !isAuthorized) {
+    if (!sessionUserId || !isAuthorized) {
       return;
     }
 
     Promise.all([
       fetchCatalog().catch(() => DEFAULT_CATALOG),
-      fetchVolunteerByUser(session.user_id).catch(() => null),
+      fetchVolunteerByUser(sessionUserId).catch(() => null),
     ])
       .then(([library, profile]) => {
         setCatalog(library ?? DEFAULT_CATALOG);
         if (profile) {
           setForm({
             ...profile,
-            user_id: session.user_id,
+            user_id: sessionUserId,
           });
           setJobQuery(profile.job_title ?? "");
           return;
         }
         setForm({
-          user_id: session.user_id,
-          name: session.name,
-          email: session.email,
+          user_id: sessionUserId,
+          name: sessionName,
+          email: sessionEmail,
           phone: "",
           address: "",
           profile_image_url: "",
@@ -103,27 +112,31 @@ export default function VolunteerProfilePage() {
         const message = loadError instanceof Error ? loadError.message : "Could not load profile details.";
         setError(message);
       });
-  }, [isAuthorized, session]);
+  }, [isAuthorized, sessionUserId, sessionName, sessionEmail]);
 
   useEffect(() => {
     setJobQuery(form?.job_title ?? "");
   }, [form?.job_title]);
 
   useEffect(() => {
-    if (!session?.volunteer_id) {
+    if (!sessionVolunteerId) {
       return;
     }
-    fetchVolunteerNotifications(session.volunteer_id, true)
+    fetchVolunteerNotifications(sessionVolunteerId, true)
       .then(async (items) => {
         setNotifications(items.map((item) => ({ id: item.id, title: item.title, message: item.message })));
         for (const item of items) {
-          await markVolunteerNotificationRead(session.volunteer_id as string, item.id);
+          await markVolunteerNotificationRead(sessionVolunteerId as string, item.id);
         }
       })
       .catch(() => undefined);
-  }, [session?.volunteer_id]);
+  }, [sessionVolunteerId]);
 
   useEffect(() => {
+    if (!isAddressMenuOpen) {
+      setAddressSuggestions([]);
+      return;
+    }
     const query = (form?.address ?? "").trim();
     if (query.length < 3) {
       setAddressSuggestions([]);
@@ -135,7 +148,7 @@ export default function VolunteerProfilePage() {
         .catch(() => setAddressSuggestions([]));
     }, 300);
     return () => clearTimeout(timer);
-  }, [form?.address]);
+  }, [form?.address, isAddressMenuOpen]);
 
   function applyAddressInput(value: string) {
     const normalized = value.trim().toLowerCase();
@@ -164,6 +177,7 @@ export default function VolunteerProfilePage() {
         : prev,
     );
     setAddressSuggestions([]);
+    setIsAddressMenuOpen(false);
   }
 
   const jobSuggestions = useMemo(() => {
@@ -203,6 +217,7 @@ export default function VolunteerProfilePage() {
   function chooseJob(job: string) {
     setForm((prev) => (prev ? { ...prev, job_title: job } : prev));
     setJobQuery(job);
+    setIsJobMenuOpen(false);
   }
 
   function addSkill(skill: string) {
@@ -297,6 +312,7 @@ export default function VolunteerProfilePage() {
       setError("Image size should be <= 1MB for this demo.");
       return;
     }
+    setSelectedImageName(file.name);
 
     const reader = new FileReader();
     reader.onload = () => {
@@ -313,7 +329,7 @@ export default function VolunteerProfilePage() {
   }
 
   async function handleSave() {
-    if (!form || !session || !catalog) {
+    if (!form || !sessionUserId || !catalog) {
       return;
     }
 
@@ -328,7 +344,7 @@ export default function VolunteerProfilePage() {
       const allowedSpecialists = new Set(catalog.specialists);
       const allowedNeedTypes = new Set(catalog.need_types);
       const allowedLanguages = new Set(catalog.languages);
-      await registerVolunteer({
+      const updatedProfile = await registerVolunteer({
         ...payload,
         job_title: resolvedJob,
         skills: (payload.skills as string[]).filter((item) => allowedSkills.has(item)),
@@ -340,6 +356,23 @@ export default function VolunteerProfilePage() {
         ),
         languages: (payload.languages as string[]).filter((item) => allowedLanguages.has(item)),
       });
+      if (session) {
+        setSession({
+          ...session,
+          name: updatedProfile.name,
+          email: updatedProfile.email ?? session.email,
+          volunteer_id: updatedProfile.id,
+        });
+      }
+      setForm((prev) =>
+        prev
+          ? {
+              ...prev,
+              name: updatedProfile.name,
+              email: updatedProfile.email ?? prev.email,
+            }
+          : prev,
+      );
       setSuccess("Profile updated successfully.");
     } catch (saveError) {
       const message = saveError instanceof Error ? saveError.message : "Could not update profile.";
@@ -413,11 +446,18 @@ export default function VolunteerProfilePage() {
               <div className="relative">
                 <input
                   value={jobQuery}
-                  onChange={(event) => setJobQuery(event.target.value)}
+                  onFocus={() => setIsJobMenuOpen(true)}
+                  onBlur={() => {
+                    window.setTimeout(() => setIsJobMenuOpen(false), 120);
+                  }}
+                  onChange={(event) => {
+                    setJobQuery(event.target.value);
+                    setIsJobMenuOpen(true);
+                  }}
                   className="w-full rounded-xl border border-[var(--border)] bg-[var(--surface-elevated)] px-3 py-2"
                   placeholder="Type to search job taxonomy"
                 />
-                {jobSuggestions.length ? (
+                {isJobMenuOpen && jobSuggestions.length ? (
                   <div className="absolute left-0 right-0 top-[calc(100%+6px)] z-20 max-h-44 overflow-auto rounded-xl border border-[var(--border)] bg-[var(--surface)] shadow-[0_14px_34px_rgba(9,26,41,0.12)]">
                     {jobSuggestions.map((job) => (
                       <button
@@ -480,21 +520,63 @@ export default function VolunteerProfilePage() {
                 <div className="flex h-full w-full items-center justify-center text-xs text-[var(--text-muted)]">No image</div>
               )}
             </div>
-            <div className="flex-1">
-              <input type="file" accept="image/*" onChange={handleFileChange} className="text-xs" />
-              <p className="mt-2 text-xs text-[var(--text-muted)]">You can also paste a direct image URL below.</p>
+            <div className="flex-1 space-y-2">
+              <input ref={imageInputRef} type="file" accept="image/*" onChange={handleFileChange} className="hidden" />
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  type="button"
+                  variant="secondary"
+                  onClick={() => imageInputRef.current?.click()}
+                >
+                  Upload Photo
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  onClick={() =>
+                    setForm((prev) =>
+                      prev
+                        ? {
+                            ...prev,
+                            profile_image_url: `https://i.pravatar.cc/160?u=${encodeURIComponent(prev.email ?? prev.name ?? Date.now().toString())}`,
+                          }
+                        : prev,
+                    )
+                  }
+                >
+                  Use Suggested Avatar
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  onClick={() => {
+                    setSelectedImageName(null);
+                    setForm((prev) => (prev ? { ...prev, profile_image_url: "" } : prev));
+                  }}
+                >
+                  Remove
+                </Button>
+              </div>
+              <p className="text-xs text-[var(--text-muted)]">
+                {selectedImageName ?? "No file selected"}
+              </p>
             </div>
           </div>
-          <label className="mt-3 block space-y-1 text-sm">
-            <span>Image URL</span>
-            <input
-              value={form.profile_image_url ?? ""}
-              onChange={(event) =>
-                setForm((prev) => (prev ? { ...prev, profile_image_url: event.target.value } : prev))
-              }
-              className="w-full rounded-xl border border-[var(--border)] bg-[var(--surface-elevated)] px-3 py-2"
-            />
-          </label>
+          <details className="mt-3 rounded-xl border border-[var(--border)] bg-[var(--surface-elevated)] p-3">
+            <summary className="cursor-pointer text-sm font-medium text-[var(--text-strong)]">
+              Advanced: Paste Image URL
+            </summary>
+            <label className="mt-3 block space-y-1 text-sm">
+              <span>Image URL</span>
+              <input
+                value={form.profile_image_url ?? ""}
+                onChange={(event) =>
+                  setForm((prev) => (prev ? { ...prev, profile_image_url: event.target.value } : prev))
+                }
+                className="w-full rounded-xl border border-[var(--border)] bg-[var(--surface)] px-3 py-2"
+              />
+            </label>
+          </details>
         </Card>
       </section>
 
@@ -506,7 +588,14 @@ export default function VolunteerProfilePage() {
               <div className="relative">
                 <input
                   value={form.address ?? ""}
-                  onChange={(event) => applyAddressInput(event.target.value)}
+                  onFocus={() => setIsAddressMenuOpen(true)}
+                  onBlur={() => {
+                    window.setTimeout(() => setIsAddressMenuOpen(false), 120);
+                  }}
+                  onChange={(event) => {
+                    applyAddressInput(event.target.value);
+                    setIsAddressMenuOpen(true);
+                  }}
                   className="w-full rounded-xl border border-[var(--border)] bg-[var(--surface-elevated)] px-3 py-2 text-sm"
                   placeholder="Search your address"
                   list="volunteer-address-suggestions"
@@ -516,7 +605,7 @@ export default function VolunteerProfilePage() {
                     <option key={`${item.lat}-${item.lng}`} value={item.display_name} />
                   ))}
                 </datalist>
-                {addressSuggestions.length > 0 ? (
+                {isAddressMenuOpen && addressSuggestions.length > 0 ? (
                   <div className="absolute left-0 right-0 top-[calc(100%+6px)] z-20 max-h-48 overflow-auto rounded-xl border border-[var(--border)] bg-[var(--surface)] shadow-[0_14px_34px_rgba(9,26,41,0.12)]">
                     {addressSuggestions.slice(0, 5).map((item) => (
                       <button
